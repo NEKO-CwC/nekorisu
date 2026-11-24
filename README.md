@@ -1,6 +1,8 @@
 # nekorisu
 
-把你和 AI Agent（Claude Code、Codex）的会话原样存到你自己选的存储里，需要时按行读回来，逐字节恢复。
+**你和 AI 的对话属于你：原样保存，逐字恢复，跨设备、跨 Agent。**
+
+nekorisu 把你在 Claude Code、Codex 里的会话原样存到你自己选的存储里，需要时按行读回来，逐字节恢复。
 
 ## 安装
 
@@ -10,7 +12,7 @@
 请读 https://raw.githubusercontent.com/NEKO-CwC/nekorisu/main/docs/agent-install.md ，先用手册开头的开场白跟我打个招呼，再按手册帮我装好 nekorisu。动手前先跟我说一声。
 ```
 
-Agent 会先跟你打个招呼，再一步步带你装好。不懂的地方直接问它；密码和令牌由你自己输入，不经过 Agent。
+Agent 会先跟你打个招呼，再一步步带你装好。不懂的地方直接问它。存储密码在它替你打开的终端里输入，服务端在浏览器里登录，都不经过 Agent。
 
 想先看看它会做什么：[`docs/agent-install.md`](docs/agent-install.md)。
 
