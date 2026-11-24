@@ -1,0 +1,298 @@
+syntax = "proto3";
+
+package nekorisu.v1;
+
+// nekorisu core: the resident process. The CLI,
+// the MCP server and other front ends are thin clients that call this service
+// over a Unix socket. Call Hello first and compare protocol versions.
+//
+// Big content never travels over the socket: Fetch returns a local file path
+// plus byte spans, and the client reads the bytes itself.
+service Core {
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+
+  // Read-only.
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+
+  // Writes run as tasks: planned -> running -> pending commit -> committed,
+  // or abandoned. The call returns at once;
+  // watch the task for progress.
+  rpc Archive(ArchiveRequest) returns (Task);
+  rpc Restore(RestoreRequest) returns (Task);
+  rpc Doctor(DoctorRequest) returns (Task);
+  rpc GetTask(TaskRequest) returns (Task);
+  rpc WatchTask(TaskRequest) returns (stream Task);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc CancelTask(TaskRequest) returns (Task);
+
+  // Records: the operations log and digests.
+  rpc AppendLog(AppendLogRequest) returns (LogEntry);
+  rpc ListLog(ListLogRequest) returns (ListLogResponse);
+  rpc PutDigest(PutDigestRequest) returns (Digest);
+  rpc GetDigests(GetDigestsRequest) returns (GetDigestsResponse);
+}
+
+enum Agent {
+  AGENT_UNSPECIFIED = 0;
+  AGENT_CLAUDE_CODE = 1;
+  AGENT_CODEX = 2;
+}
+
+// Text form: "<agent>:<id>", e.g. "claude-code:73ffc2c4-…".
+message SessionRef {
+  Agent agent = 1;
+  string id = 2;
+}
+
+message HelloRequest {
+  uint32 protocol_version = 1;
+  string client_version = 2;
+  string client_kind = 3;  // "cli", "mcp", "app"
+}
+
+message HelloResponse {
+  uint32 protocol_version = 1;
+  string core_version = 2;
+  string device_id = 3;
+  uint32 pid = 4;
+  int64 started_at_ms = 5;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {
+  uint32 config_version = 1;
+  string source = 2;  // "local" for now
+}
+
+message ScanRequest {
+  repeated Agent agents = 1;  // empty = all
+}
+
+message ScanResponse {
+  repeated AgentSummary agents = 1;
+}
+
+message AgentSummary {
+  Agent agent = 1;
+  string home = 2;
+  bool found = 3;
+  uint64 sessions = 4;            // root sessions
+  uint64 child_sessions = 5;      // Codex sub-agent threads
+  uint64 subagent_files = 6;      // Claude Code sub-agent transcripts
+  uint64 files = 7;               // every file of every bundle
+  uint64 bytes = 8;
+  uint64 compressed_files = 9;    // Codex .jsonl.zst
+  uint64 archived_by_agent = 10;  // Codex archived_sessions/
+  uint64 cleanup_within_7d = 11;  // sessions the agent itself starts deleting within 7 days
+  int64 oldest_activity_ms = 12;
+}
+
+message StatusRequest {
+  repeated Agent agents = 1;
+  int64 since_ms = 2;
+  uint32 limit = 3;  // 0 = no limit
+}
+
+message StatusResponse {
+  repeated SessionStatus sessions = 1;
+}
+
+message SessionStatus {
+  SessionRef session = 1;
+  SessionRef parent = 2;          // set for Codex sub-agent threads
+  string project = 3;             // Claude Code project dir, Codex cwd
+  int64 last_activity_ms = 4;
+  uint64 bytes = 5;
+  uint32 files = 6;
+  uint32 children = 7;
+  UploadState upload = 8;
+  int64 cleanup_at_ms = 9;        // when the agent starts deleting files of this bundle; 0 = never
+  bool compressed = 10;
+  bool archived_by_agent = 11;
+}
+
+message UploadState {
+  bool uploaded = 1;
+  int64 last_upload_ms = 2;
+  uint64 new_bytes = 3;
+  uint64 new_lines = 4;
+  bool rewritten = 5;  // bytes uploaded last time changed locally
+}
+
+message SearchRequest {
+  string query = 1;
+  repeated Agent agents = 2;
+  string device = 3;
+  int64 since_ms = 4;
+  int64 until_ms = 5;
+  uint32 limit = 6;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+}
+
+message SearchHit {
+  SessionRef session = 1;
+  string device = 2;
+  string project = 3;
+  int64 last_activity_ms = 4;
+  string source = 5;  // "digest", "log", "manifest", "local"
+  string snippet = 6;
+  bool local = 7;     // the original is on this machine
+}
+
+// Line numbers are 1-based and inclusive.
+message LineRange {
+  uint64 start = 1;
+  uint64 end = 2;  // 0 = to the end
+}
+
+message FetchRequest {
+  SessionRef session = 1;
+  string file = 2;               // a file of the bundle, e.g. "subagents/agent-a1.jsonl"; empty = main transcript
+  repeated LineRange lines = 3;  // empty = every line
+  repeated string kinds = 4;     // "user", "assistant", "reasoning", "tool", "meta"; empty = all
+  uint32 limit = 5;              // max lines; 0 = no limit
+  bool whole = 6;                // only make the whole file available locally
+  string version = 7;            // manifest id; empty or "local" = the local original
+}
+
+message FetchResponse {
+  string path = 1;            // local file to read the bytes from
+  uint64 size = 2;            // bytes covered by this answer
+  uint64 total_lines = 3;
+  repeated LineSpan spans = 4;
+  bool truncated = 5;         // more lines matched than `limit`
+  string version = 6;         // "local" or a manifest id
+  repeated string files = 7;  // transcripts in the bundle (relative paths)
+}
+
+message LineSpan {
+  uint64 line = 1;
+  uint64 offset = 2;
+  uint64 length = 3;  // without the line break
+  string kind = 4;
+  string raw_type = 5;
+  int64 timestamp_ms = 6;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PLANNED = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_PENDING_COMMIT = 3;
+  TASK_STATE_COMMITTED = 4;
+  TASK_STATE_ABANDONED = 5;
+}
+
+message Task {
+  string id = 1;
+  string kind = 2;  // "archive", "restore", "doctor"
+  TaskState state = 3;
+  repeated SessionRef sessions = 4;
+  string summary = 5;
+  uint64 done_bytes = 6;
+  uint64 total_bytes = 7;
+  string error = 8;
+  int64 created_at_ms = 9;
+  int64 updated_at_ms = 10;
+  string result_json = 11;
+}
+
+message ArchiveRequest {
+  repeated SessionRef sessions = 1;
+  string storage = 2;  // storage name in config.toml; empty = default
+  repeated string digest_ids = 3;
+}
+
+message RestoreRequest {
+  SessionRef session = 1;
+  string version = 2;  // manifest id; empty = newest head
+  bool replace = 3;    // replace a local copy that differs
+  string storage = 4;
+}
+
+message DoctorRequest {
+  repeated SessionRef sessions = 1;  // empty = everything uploaded
+  string storage = 2;
+}
+
+message TaskRequest {
+  string id = 1;
+}
+
+message ListTasksRequest {
+  bool active_only = 1;
+  uint32 limit = 2;
+}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+}
+
+message LogEntry {
+  uint64 seq = 1;
+  string device = 2;
+  int64 at_ms = 3;
+  string op = 4;  // "archive", "restore", "note", "digest", ...
+  repeated SessionRef sessions = 5;
+  repeated string tags = 6;
+  string note = 7;
+  string detail_json = 8;
+}
+
+message AppendLogRequest {
+  repeated SessionRef sessions = 1;
+  repeated string tags = 2;
+  string note = 3;
+}
+
+message ListLogRequest {
+  repeated SessionRef sessions = 1;
+  int64 since_ms = 2;
+  uint32 limit = 3;
+}
+
+message ListLogResponse {
+  repeated LogEntry entries = 1;
+}
+
+message DigestRef {
+  SessionRef session = 1;
+  string file = 2;
+  repeated LineRange lines = 3;
+}
+
+// Core treats the body as opaque; what goes in it is up to the writer.
+message Digest {
+  string id = 1;
+  repeated DigestRef refs = 2;
+  string body = 3;
+  int64 updated_at_ms = 4;
+}
+
+message PutDigestRequest {
+  string id = 1;  // empty = new digest; otherwise replace it
+  repeated DigestRef refs = 2;
+  string body = 3;
+}
+
+message GetDigestsRequest {
+  string id = 1;
+  SessionRef session = 2;  // digests that reference this session
+}
+
+message GetDigestsResponse {
+  repeated Digest digests = 1;
+}

@@ -1,0 +1,250 @@
+syntax = "proto3";
+
+package nekorisu.cloud.v1;
+
+// The cloud protocol: a device talks to its trusted source, which is a
+// server the user runs. The device only takes configuration from the source;
+// sessions never go to it.
+//
+// Transport is gRPC over TLS. Only unary calls and server streams are used, so
+// the protocol also passes CDNs.
+//
+// Metadata on every request:
+//   nekorisu-protocol  major protocol version, "1"
+//   nekorisu-version   client version
+//   nekorisu-device    device ID
+//   authorization      "Bearer <token>". No token: the device gets the
+//                      public default config only and does not report.
+//
+// Within a major version fields and methods are only added, never changed;
+// readers ignore fields they do not know. A new major version is a new
+// package (nekorisu.cloud.v2).
+//
+// Status codes: UNAUTHENTICATED for a token that is not valid;
+// FAILED_PRECONDITION when the source does not accept nekorisu-protocol;
+// NOT_FOUND for a resource the caller may not see (same code, so it does not
+// reveal what exists).
+service Cloud {
+  // Send the ETag of the config the device holds. Nothing new: not_modified.
+  // Otherwise a signed config.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+  // Fetch a resource a config refers to, by SHA-256, in chunks.
+  rpc GetResource(GetResourceRequest) returns (stream ResourceChunk);
+
+  // Tell the source the device's config state. Never carries
+  // session content, paths or session IDs. Needs a token.
+  rpc ReportState(ReportStateRequest) returns (ReportStateResponse);
+}
+
+// ---- GetConfig ----
+
+message GetConfigRequest {
+  // The etag of the last config the device accepted; empty = none yet.
+  string etag = 1;
+}
+
+message GetConfigResponse {
+  oneof result {
+    // The device's etag is current.
+    NotModified not_modified = 1;
+    SignedConfig config = 2;
+  }
+  // Opaque; the source chooses it. Set when `config` is set. The device sends
+  // it back in the next GetConfig.
+  string etag = 3;
+}
+
+message NotModified {}
+
+// The envelope. The signature is over the exact bytes of
+// `payload`, so no JSON canonicalization is needed.
+message SignedConfig {
+  // A Config as JSON; exactly the bytes that were signed.
+  bytes payload = 1;
+  // Which public key verifies it: the first 8 bytes of SHA-256 over the raw
+  // Ed25519 public key, in hex (nekorisu::sign::key_id). Unknown key: the
+  // device drops the whole config.
+  string key_id = 2;
+  // Ed25519 over "nekorisu/config/v1" || 0x00 || payload
+  // (nekorisu::sign, CONTEXT_CONFIG).
+  bytes signature = 3;
+}
+
+// The document inside SignedConfig.payload, as JSON: the proto3
+// JSON mapping with the original field names. Unknown fields
+// are ignored. Resources are referenced by SHA-256, never inlined; the
+// signature covers the SHA-256, so a resource can come from anywhere.
+message Config {
+  // Config format version, e.g. "1.0". A major version the device does not
+  // know: the whole config is dropped.
+  string schema = 1;
+  // Increasing. Not greater than the serial the device holds: rejected, so an
+  // old config cannot be swapped back in.
+  uint64 serial = 2;
+  // RFC 3339, UTC.
+  string issued_at = 3;
+  // A client older than this tells the user to update.
+  string min_client_version = 4;
+  // What this source supports. The client uses a feature only if listed.
+  repeated string features = 5;
+  // Seconds between GetConfig calls; 0 = the client default (1 hour).
+  uint32 poll_interval_secs = 6;
+  UpdateConfig update = 7;
+  DigestConfig digest = 8;
+  LocalConfig local = 9;
+  // Overrides of keys a device has locked.
+  repeated ForceRequest force = 10;
+  // Requests about the "accept everything" switch.
+  repeated ExecRequest requests = 11;
+  // The table that decides a line's kind: user, assistant, reasoning, tool,
+  // meta. Data.
+  ResourceRef kind_rules = 12;
+}
+
+// A resource fetched with GetResource.
+message ResourceRef {
+  string name = 1;
+  string version = 2;
+  // Lowercase hex SHA-256 of the resource bytes.
+  string sha256 = 3;
+  // true: a script. A device runs it only when its "accept everything" switch
+  // is on; otherwise it only logs and reminds the user. false: data (a recipe,
+  // a rules table) that every device accepts.
+  bool executable = 4;
+}
+
+message UpdateConfig {
+  // "stable" or "beta".
+  string channel = 1;
+  // Where to fetch the channel manifest (<channel>.json). Tried in order,
+  // before the device's own list and the address built into the binary.
+  repeated string urls = 2;
+}
+
+// The two kinds of digest. Both are defaults: the
+// device's own setting wins.
+message DigestConfig {
+  // Excerpt recipe, data. Unset: no excerpt unless the device defines one.
+  ResourceRef excerpt = 1;
+  // Summary recipe or script. Unset: no summary.
+  ResourceRef summary = 2;
+}
+
+message LocalConfig {
+  // The default form of the device's own copy of a session: "pruned" or
+  // "full". Empty = the client default, pruned. The remote always holds the full original and
+  // restore always fetches it, whatever this says.
+  string copy_form = 1;
+}
+
+// Asks to override keys the device has locked. The device does not apply it
+// until the user runs `nekorisu source accept <id>` on that device; until then
+// it lists it as pending and reports it. `nekorisu source reject <id>` refuses.
+message ForceRequest {
+  string id = 1;
+  repeated ForceChange changes = 2;
+  // Device IDs this is for. Empty = every device.
+  repeated string devices = 3;
+}
+
+message ForceChange {
+  // A dotted path into Config, e.g. "local.copy_form".
+  string key = 1;
+  // The new value as JSON text, e.g. "\"full\"".
+  string value_json = 2;
+}
+
+// The "accept everything" switch can only be turned on at the device, so
+// ALLOW is only a request. REVOKE turns it off at once, no confirmation
+//.
+message ExecRequest {
+  string id = 1;
+  ExecAction action = 2;
+  // Empty = every device.
+  repeated string devices = 3;
+}
+
+enum ExecAction {
+  EXEC_ACTION_UNSPECIFIED = 0;
+  EXEC_ACTION_ALLOW = 1;
+  EXEC_ACTION_REVOKE = 2;
+}
+
+// ---- GetResource ----
+
+message GetResourceRequest {
+  // Lowercase hex SHA-256 of the resource, as in a ResourceRef. The device
+  // checks the assembled bytes against it.
+  string sha256 = 1;
+}
+
+message ResourceChunk {
+  // Set on the first chunk only: the size of the whole resource in bytes.
+  uint64 total_size = 1;
+  // In order. Keep a chunk at or under 1 MiB.
+  bytes data = 2;
+}
+
+// ---- ReportState ----
+
+// The device's configuration state, so the source can see it.
+// The client version is in the nekorisu-version metadata.
+message ReportStateRequest {
+  // The config the device runs; 0 and empty = none applied yet.
+  uint64 applied_serial = 1;
+  string applied_etag = 2;
+  // Keys the user changed on this device, locked or not.
+  repeated LocalValue local_values = 3;
+  // The "accept everything" switch.
+  bool exec_allowed = 4;
+  // What the device did with the requests it has seen.
+  repeated RequestStatus requests = 5;
+  // The newest config the device refused, so the source can show why a device
+  // is behind. Unset when nothing was refused.
+  ConfigFailure last_failure = 6;
+}
+
+message LocalValue {
+  // Same naming as ForceChange.key. A value the device keeps in its keychain
+  // is never reported.
+  string key = 1;
+  string value_json = 2;
+  // Locked with `nekorisu config set --lock`: the source's value does not
+  // apply unless the user accepts a ForceRequest.
+  bool locked = 3;
+}
+
+message RequestStatus {
+  // The id of a ForceRequest or an ExecRequest.
+  string id = 1;
+  RequestState state = 2;
+}
+
+enum RequestState {
+  REQUEST_STATE_UNSPECIFIED = 0;
+  // Listed in `nekorisu status`, waiting for the user.
+  REQUEST_STATE_PENDING = 1;
+  REQUEST_STATE_ACCEPTED = 2;
+  REQUEST_STATE_REJECTED = 3;
+}
+
+// Why a config was not applied.
+message ConfigFailure {
+  uint64 serial = 1;
+  ConfigFailureReason reason = 2;
+}
+
+enum ConfigFailureReason {
+  CONFIG_FAILURE_REASON_UNSPECIFIED = 0;
+  // Unknown key_id or the signature does not verify.
+  CONFIG_FAILURE_REASON_BAD_SIGNATURE = 1;
+  CONFIG_FAILURE_REASON_UNSUPPORTED_SCHEMA = 2;
+  // A resource could not be fetched.
+  CONFIG_FAILURE_REASON_RESOURCE_UNAVAILABLE = 3;
+  // A resource did not match its SHA-256.
+  CONFIG_FAILURE_REASON_RESOURCE_HASH_MISMATCH = 4;
+  CONFIG_FAILURE_REASON_OTHER = 5;
+}
+
+message ReportStateResponse {}

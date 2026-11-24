@@ -1,0 +1,91 @@
+# Builds and publishes a release when a tag like v0.1.0 (stable) or
+# v0.2.0-beta.1 (beta) is pushed. See docs/release.md.
+#
+# Only GitHub's own actions are used. The signing key lives in the `release`
+# environment and is only readable by the publish job; restrict that
+# environment to `v*` tags in the repository settings.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$v\"$" Cargo.toml || { echo "tag $GITHUB_REF_NAME does not match the version in Cargo.toml"; exit 1; }
+      - name: Root keys are built in
+        run: |
+          grep -v '^[[:space:]]*#' keys/root.pub | grep -q '[A-Za-z0-9]' || { echo "keys/root.pub has no keys; see docs/release.md"; exit 1; }
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --bin nekorisu --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir pkg
+          cp "target/${{ matrix.target }}/release/nekorisu" pkg/
+          tar -C pkg -czf "nekorisu-${{ matrix.target }}.tar.gz" nekorisu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nekorisu-${{ matrix.target }}
+          path: nekorisu-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nekorisu-*
+          merge-multiple: true
+      - name: Channel
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          case "$v" in
+            *-*) echo "CHANNEL=beta" >> "$GITHUB_ENV"; echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV" ;;
+            *) echo "CHANNEL=stable" >> "$GITHUB_ENV"; echo "PRERELEASE=" >> "$GITHUB_ENV" ;;
+          esac
+      - name: Sign
+        env:
+          NEKORISU_SIGNING_KEY: ${{ secrets.NEKORISU_SIGNING_KEY }}
+        run: |
+          rustup update stable && rustup default stable
+          cargo build --locked --bin nekorisu-release
+          ./target/debug/nekorisu-release manifest \
+            --channel "$CHANNEL" --version "$VERSION" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
+            --dist dist --cert keys/release-cert.json --key-env NEKORISU_SIGNING_KEY
+          ./target/debug/nekorisu-release verify "dist/$CHANNEL.json"
+          cp scripts/install.sh dist/
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag $PRERELEASE
