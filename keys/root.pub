@@ -1,4 +1,5 @@
 # nekorisu 的根公钥。每行一把：base64，后面可以跟 # 注释。
 # 第一行是正在用的，第二行是备用的。私钥在维护者的密码管理器里，不在仓库里。
-# 现在还是空的：维护者用 `nekorisu-release keygen` 生成以后填进来（docs/release.md）。
 # 没有公钥时，自动更新关闭，发版流程也会失败。
+MAerEvy9L8s5TJeEAocmYraMDDUnljZZFFqQw3VE5go= # root 1, key_id 6ef61869c3792dae（正在用）
+sfPEH5hRSWRLa1pSESbcxnnQKbxl34dI3BE787Ue7Jo= # root 2, key_id 7f50a4191ddbe180（备用）
