@@ -30,7 +30,9 @@ die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 case "$(uname -s)" in
   Darwin) os=apple-darwin ;;
   Linux) os=unknown-linux-musl ;;
-  *) die "不支持这个系统：$(uname -s)（只支持 macOS 和 Linux）" ;;
+  MINGW* | MSYS* | CYGWIN*)
+    die '这是 Windows，请在 PowerShell 里用 install.ps1 安装：powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/NEKO-CwC/nekorisu/releases/latest/download/install.ps1 | iex"' ;;
+  *) die "不支持这个系统：$(uname -s)（支持 macOS、Linux 和 Windows）" ;;
 esac
 case "$(uname -m)" in
   arm64 | aarch64) arch=aarch64 ;;
