@@ -372,13 +372,36 @@ mod imp {
             use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
             use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION};
 
+            /// A descriptor as SDDL text. Windows writes some accounts by a short name instead
+            /// of their SID (the built-in Administrator is `LA`), so compare texts from here only.
+            ///
+            /// SAFETY: `descriptor` must be a valid security descriptor.
+            unsafe fn text(descriptor: PSECURITY_DESCRIPTOR, info: u32) -> String {
+                // SAFETY: valid descriptor and out-pointer; the text is freed with LocalFree.
+                unsafe {
+                    let mut text: *mut u16 = std::ptr::null_mut();
+                    let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        descriptor,
+                        SDDL_REVISION_1,
+                        info,
+                        &mut text,
+                        std::ptr::null_mut(),
+                    );
+                    assert_ne!(ok, 0, "ConvertSecurityDescriptorToStringSecurityDescriptorW");
+                    let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+                    let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                    LocalFree(text.cast());
+                    sddl
+                }
+            }
+
             let home = tempfile::tempdir().unwrap();
             let server = Descriptor::new()
                 .unwrap()
                 .create(&pipe_name(home.path()), true)
                 .unwrap();
             let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
-            // SAFETY: valid handle and out-pointers; both returned buffers are freed with LocalFree.
+            // SAFETY: valid handle and out-pointer; the descriptor is freed with LocalFree.
             let sddl = unsafe {
                 let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
                 let status = GetSecurityInfo(
@@ -392,34 +415,23 @@ mod imp {
                     &mut descriptor,
                 );
                 assert_eq!(status, 0, "GetSecurityInfo");
-                let mut text: *mut u16 = std::ptr::null_mut();
-                let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                    descriptor,
-                    SDDL_REVISION_1,
-                    info,
-                    &mut text,
-                    std::ptr::null_mut(),
-                );
-                assert_ne!(ok, 0, "ConvertSecurityDescriptorToStringSecurityDescriptorW");
-                let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-                let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-                LocalFree(text.cast());
+                let sddl = text(descriptor, info);
                 LocalFree(descriptor);
                 sddl
             };
             // Owned by this user; GA is stored as the pipe's own "all access" (FA).
             let me = user_sid().unwrap();
-            let expected = format!("O:{me}D:P(A;;FA;;;{me})(A;;FA;;;SY)");
+            let expected = Descriptor::from_sddl(&format!("O:{me}D:P(A;;FA;;;{me})(A;;FA;;;SY)")).unwrap();
+            // SAFETY: a valid descriptor, alive until the end of this statement.
+            let expected = unsafe { text(expected.0, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION) };
+            let shown = || sddl.replace(&me, "<user>");
             assert!(
                 sddl.starts_with(&expected),
-                "{}",
-                sddl.replace(&user_sid().unwrap(), "<user>")
+                "{} != {}",
+                shown(),
+                expected.replace(&me, "<user>")
             );
-            assert!(
-                !sddl.contains(";;;HI)") && !sddl.contains(";;;SI)"),
-                "{}",
-                sddl.replace(&user_sid().unwrap(), "<user>")
-            );
+            assert!(!sddl.contains(";;;HI)") && !sddl.contains(";;;SI)"), "{}", shown());
         }
 
         /// A pipe of core's name that someone else owns is refused. Here it is owned by the
