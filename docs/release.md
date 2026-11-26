@@ -55,11 +55,11 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 - `v0.1.0` 这种发到 stable 渠道；`v0.2.0-beta.1` 这种（带 `-`）发到 beta 渠道，标成预发布。
-- `.github/workflows/release.yml` 会构建四个平台，签名 `<渠道>.json`，验证一遍，再上传：
-  - 压缩包 `nekorisu-<平台>.tar.gz`；
+- `.github/workflows/release.yml` 会构建五个平台（macOS 和 Linux 各两个，加上 Windows x86_64），签名 `<渠道>.json`，验证一遍，再上传：
+  - 压缩包 `nekorisu-<平台>.tar.gz`。Windows 的是 `nekorisu-x86_64-pc-windows-msvc.tar.gz`，里面有 `nekorisu.exe` 和运行 core 的启动器 `nekorisu-start.exe`；
   - `SHA256SUMS`；
   - `<渠道>.json`；
-  - `install.sh`。
+  - `install.sh`，以及给 Windows 的 `install.ps1`。
 
   你不用做别的。
 - 客户端只升不降，所以版本号只能往上走。

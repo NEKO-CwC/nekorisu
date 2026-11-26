@@ -16,6 +16,12 @@ Agent 会先跟你打个招呼，再一步步带你装好。不懂的地方直�
 
 想先看看它会做什么：[`docs/agent-install.md`](docs/agent-install.md)。
 
+支持 macOS、Linux 和 64 位的 Windows 10 / 11。在 Windows 上想自己装，在 PowerShell 里运行（不需要管理员权限）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/NEKO-CwC/nekorisu/releases/latest/download/install.ps1 | iex"
+```
+
 ## 存储放在哪
 
 nekorisu 会在你给的存储地址下面自己建一个 `nekorisu/` 文件夹，所有东西都放在 `nekorisu/v1/` 里。所以地址填它的**上一层**就行，不用自己再建一个叫 nekorisu 的文件夹，否则会变成 `nekorisu/nekorisu/v1/`。

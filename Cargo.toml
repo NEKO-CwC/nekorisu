@@ -16,7 +16,6 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 flate2 = "1.1.11"
 hex = "0.4.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
-libc = "0.2.191"
 prost = "0.14"
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "system-proxy"] }
@@ -34,6 +33,19 @@ tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.14"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+# The version tokio already uses, so no second copy is built.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
 
 [build-dependencies]
 protox = "0.10"

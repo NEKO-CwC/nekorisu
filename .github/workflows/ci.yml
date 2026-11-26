@@ -13,8 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # Git Bash on Windows
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
@@ -22,3 +25,24 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: sh -n scripts/install.sh
+      # install.ps1 must stay ASCII (see the note above its messages) and parse.
+      - name: install.ps1 is ASCII
+        run: |
+          if LC_ALL=C grep -n '[^[:print:][:space:]]' scripts/install.ps1; then
+            echo "scripts/install.ps1 must be plain ASCII"; exit 1
+          fi
+      - name: install.ps1 parses (PowerShell 7)
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
+          if ($errors) { exit 1 }
+      - name: install.ps1 parses (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
+          if ($errors) { exit 1 }

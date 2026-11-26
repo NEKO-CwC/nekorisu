@@ -10,11 +10,14 @@
 //!
 //! Only installs made by the install script (a symlink into versions/) are
 //! updated; a binary built from source or installed another way is left alone.
+//!
+//! Windows swaps only the platform pieces: the "symlink" is a hard link (or copy) of the
+//! versioned `nekorisu.exe` plus a pointer file naming it (`repoint_copy`), and the handover
+//! exits so the login launcher starts the new core, instead of exec'ing it (`hand_over`).
 
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -24,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::UpdateConfig;
-use crate::paths::{self, Paths};
+use crate::paths::{self, BINARY_NAME, Paths};
 use crate::timefmt::now_ms;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,7 +35,11 @@ pub const TARGET: &str = env!("NEKORISU_TARGET");
 const BUILTIN_URL: &str = "https://github.com/NEKO-CwC/nekorisu/releases/latest/download/{channel}.json";
 const MAX_MANIFEST_BYTES: usize = 1 << 20;
 const MAX_ASSET_BYTES: u64 = 512 << 20;
-const BINARY_NAME: &str = "nekorisu";
+/// Unpacked from the release archive into the version's folder; the first one must be there.
+#[cfg(unix)]
+const ARCHIVE_FILES: &[&str] = &[BINARY_NAME];
+#[cfg(windows)]
+const ARCHIVE_FILES: &[&str] = &[BINARY_NAME, paths::LAUNCHER_NAME];
 /// A new core that fails to come up this many times in a row is rolled back.
 const MAX_START_ATTEMPTS: u32 = 3;
 /// Local state copied aside before switching versions (the new version may migrate it).
@@ -187,8 +194,15 @@ async fn fetch_limited(client: &reqwest::Client, url: &str, limit: usize) -> any
     Ok(bytes)
 }
 
-/// Downloads, checks and unpacks the new version; returns the path of its binary.
+/// Downloads, checks and unpacks the new version, then runs it once; returns the path of its binary.
 pub async fn stage(paths: &Paths, candidate: &Candidate) -> anyhow::Result<PathBuf> {
+    let binary = download(paths, candidate).await?;
+    self_test(&binary, &candidate.manifest.version).await?;
+    Ok(binary)
+}
+
+/// `stage` without the self-test.
+async fn download(paths: &Paths, candidate: &Candidate) -> anyhow::Result<PathBuf> {
     let version = &candidate.manifest.version;
     let asset = &candidate.asset;
     if asset.size > MAX_ASSET_BYTES {
@@ -226,67 +240,101 @@ pub async fn stage(paths: &Paths, candidate: &Candidate) -> anyhow::Result<PathB
     }
 
     let unpack = {
-        let (archive, binary) = (archive.clone(), binary.clone());
-        tokio::task::spawn_blocking(move || unpack_binary(&archive, &binary))
+        let (archive, dir) = (archive.clone(), dir.clone());
+        tokio::task::spawn_blocking(move || unpack(&archive, &dir, ARCHIVE_FILES))
     };
     let unpacked = unpack.await?;
     let _ = fs::remove_file(&archive);
     unpacked?;
-
-    self_test(&binary, version).await?;
     Ok(binary)
 }
 
-fn unpack_binary(archive: &Path, binary: &Path) -> anyhow::Result<()> {
+/// Unpacks the files called `names` (wherever they sit in the archive) into `dir`.
+/// The first name is required; the others are taken when present.
+fn unpack(archive: &Path, dir: &Path, names: &[&str]) -> anyhow::Result<()> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive)?));
+    let mut found = Vec::new();
     for entry in tar.entries()? {
         let mut entry = entry?;
-        let is_binary =
-            entry.header().entry_type().is_file() && entry.path()?.file_name().is_some_and(|n| n == BINARY_NAME);
-        if !is_binary {
+        if !entry.header().entry_type().is_file() {
             continue;
         }
-        let part = binary.with_extension("part");
+        let name = {
+            let path = entry.path()?;
+            names
+                .iter()
+                .copied()
+                .find(|n| path.file_name().is_some_and(|f| f == *n))
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let target = dir.join(name);
+        let part = target.with_extension("part");
         let mut out = fs::File::create(&part)?;
         let mut limited = (&mut entry).take(MAX_ASSET_BYTES);
         std::io::copy(&mut limited, &mut out)?;
         out.sync_all()?;
         set_mode(&part, 0o755)?;
-        fs::rename(&part, binary)?;
-        return Ok(());
+        fs::rename(&part, &target)?;
+        found.push(name);
     }
-    bail!("压缩包里没有 {BINARY_NAME}")
+    if !found.contains(&names[0]) {
+        bail!("压缩包里没有 {}", names[0]);
+    }
+    Ok(())
 }
 
 /// Runs the new binary once, so a build that can't run on this machine never gets switched in.
 async fn self_test(binary: &Path, version: &str) -> anyhow::Result<()> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(binary)
-            .arg("--version")
-            .env_remove(LOCK_FD_ENV)
-            .output(),
-    )
-    .await
-    .context("新版本自检超时")??;
+    let mut command = tokio::process::Command::new(binary);
+    command.arg("--version");
+    #[cfg(unix)]
+    command.env_remove(LOCK_FD_ENV);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .context("新版本自检超时")??;
     let printed = String::from_utf8_lossy(&output.stdout);
-    let expected = format!("{BINARY_NAME} {version}");
+    let expected = format!("nekorisu {version}");
     if !output.status.success() || printed.trim() != expected {
         bail!("新版本自检不通过：应该打印 {expected}，实际是 {}", printed.trim());
     }
     Ok(())
 }
 
-/// The symlink this installation runs through, if the install script made it.
+/// The link this installation runs through, if the install script made it.
 pub fn installed_link(paths: &Paths, config: &UpdateConfig) -> Option<PathBuf> {
     let link = config.link.clone().unwrap_or_else(paths::default_link);
-    let target = fs::read_link(&link).ok()?;
-    let target = if target.is_absolute() {
-        target
-    } else {
-        link.parent()?.join(target)
-    };
+    let target = link_target(paths, &link)?;
     target.starts_with(paths.versions_dir()).then_some(link)
+}
+
+/// The versioned binary `link` stands for: the symlink's target on Unix; on Windows
+/// what the pointer file names, as long as the link itself is there.
+pub fn link_target(paths: &Paths, link: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let _ = paths;
+        let target = fs::read_link(link).ok()?;
+        Some(if target.is_absolute() {
+            target
+        } else {
+            link.parent()?.join(target)
+        })
+    }
+    #[cfg(not(unix))]
+    copy_target(paths, link)
+}
+
+#[cfg_attr(unix, allow(dead_code))]
+fn copy_target(paths: &Paths, link: &Path) -> Option<PathBuf> {
+    if !link.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(paths.current_pointer()).ok()?;
+    // Tolerate a BOM or a line break from an editor or PowerShell.
+    let text = text.trim_start_matches('\u{feff}').trim_end();
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
 /// Marker written just before switching; the new core reads it on startup.
@@ -300,9 +348,9 @@ pub struct Marker {
     pub at_ms: i64,
 }
 
-/// Backs up local state, writes the marker and repoints the symlink.
+/// Backs up local state, writes the marker and repoints the link.
 pub fn install(paths: &Paths, link: &Path, binary: &Path, to_version: &str) -> anyhow::Result<()> {
-    let from_target = fs::read_link(link).with_context(|| format!("读不了 {}", link.display()))?;
+    let from_target = link_target(paths, link).with_context(|| format!("读不了 {} 指向的版本", link.display()))?;
     let backup = paths.backup_dir().join(VERSION);
     fs::create_dir_all(&backup)?;
     for name in STATE_FILES {
@@ -321,16 +369,130 @@ pub fn install(paths: &Paths, link: &Path, binary: &Path, to_version: &str) -> a
     };
     fs::create_dir_all(paths.run_dir())?;
     write_atomic(&paths.upgrade_marker(), &serde_json::to_vec_pretty(&marker)?)?;
-    repoint(link, binary)
+    repoint(paths, link, binary)
+}
+
+/// Makes `link` stand for `target`.
+fn repoint(paths: &Paths, link: &Path, target: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = paths;
+        repoint_symlink(link, target)
+    }
+    #[cfg(not(unix))]
+    repoint_copy(paths, link, target)
 }
 
 /// Atomically makes `link` point at `target` (new symlink, then rename over the old one).
-fn repoint(link: &Path, target: &Path) -> anyhow::Result<()> {
+#[cfg(unix)]
+fn repoint_symlink(link: &Path, target: &Path) -> anyhow::Result<()> {
     let tmp = link.with_extension("nekorisu-new");
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(target, &tmp)?;
     fs::rename(&tmp, link).with_context(|| format!("换不了 {}", link.display()))?;
     Ok(())
+}
+
+/// The Windows link: ordinary users can't make symlinks, so `link` is a hard link to `target`
+/// (a copy when they sit on different volumes) and the pointer file names `target`. A running
+/// binary can't be replaced but can be renamed: the new one is put next to it, the old one is
+/// renamed aside to `<link>.old-<ms>` (removed on a later core start), the new one takes its
+/// name, then the pointer is written. On failure the old one goes back.
+#[cfg_attr(unix, allow(dead_code))]
+fn repoint_copy(paths: &Paths, link: &Path, target: &Path) -> anyhow::Result<()> {
+    let fresh = with_suffix(link, ".nekorisu-new");
+    let _ = fs::remove_file(&fresh);
+    if fs::hard_link(target, &fresh).is_err() {
+        fs::copy(target, &fresh).with_context(|| format!("复制不了 {}", target.display()))?;
+    }
+    let aside = with_suffix(link, &format!(".old-{}", now_ms()));
+    let moved = match fs::rename(link, &aside) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            let _ = fs::remove_file(&fresh);
+            return Err(err).with_context(|| format!("挪不开 {}", link.display()));
+        }
+    };
+    let switched = fs::rename(&fresh, link)
+        .with_context(|| format!("换不了 {}", link.display()))
+        .and_then(|()| write_atomic(&paths.current_pointer(), target.to_string_lossy().as_bytes()));
+    if let Err(err) = switched {
+        let _ = fs::remove_file(&fresh);
+        if moved {
+            let _ = fs::remove_file(link);
+            let _ = fs::rename(&aside, link);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// `link` with `suffix` added to its file name.
+#[cfg_attr(unix, allow(dead_code))]
+fn with_suffix(link: &Path, suffix: &str) -> PathBuf {
+    let mut name = link.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    link.with_file_name(name)
+}
+
+/// Removes binaries earlier switches renamed aside, once nothing runs them any more.
+#[cfg_attr(unix, allow(dead_code))]
+fn sweep_aside(link: &Path) {
+    let (Some(dir), Some(name)) = (link.parent(), link.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.old-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = fs::remove_file(entry.path()); // still running: next time
+        }
+    }
+}
+
+/// Copies the current version's login launcher next to `link` when it differs. The one there
+/// is usually running (it runs core), so it is renamed aside first, like the binary in
+/// `repoint_copy`; the new one takes over at the next login.
+#[cfg_attr(unix, allow(dead_code))]
+fn refresh_launcher(paths: &Paths, link: &Path) {
+    let (Some(target), Some(dir)) = (copy_target(paths, link), link.parent()) else {
+        return;
+    };
+    let Some(source) = target.parent().map(|d| d.join(paths::LAUNCHER_NAME)) else {
+        return;
+    };
+    let installed = dir.join(paths::LAUNCHER_NAME);
+    let (Ok(new), old) = (fs::read(&source), fs::read(&installed)) else {
+        return;
+    };
+    if old.as_ref().is_ok_and(|old| *old == new) {
+        return;
+    }
+    let aside = with_suffix(&installed, &format!(".old-{}", now_ms()));
+    if old.is_ok() && fs::rename(&installed, &aside).is_err() {
+        return;
+    }
+    if fs::copy(&source, &installed).is_err() && old.is_ok() {
+        let _ = fs::rename(&aside, &installed);
+    }
+}
+
+/// On core start, Windows only: removes binaries renamed aside by earlier switches and
+/// refreshes the login launcher from the current version. Errors are ignored.
+pub fn tidy_install(paths: &Paths) {
+    #[cfg(windows)]
+    {
+        let config = crate::config::load(paths).unwrap_or_default();
+        let link = config.update.link.unwrap_or_else(paths::default_link);
+        sweep_aside(&link);
+        sweep_aside(&link.with_file_name(paths::LAUNCHER_NAME));
+        refresh_launcher(paths, &link);
+    }
+    #[cfg(not(windows))]
+    let _ = paths;
 }
 
 pub enum Startup {
@@ -379,7 +541,7 @@ pub fn on_core_start(paths: &Paths) -> Startup {
 }
 
 fn rollback(paths: &Paths, marker: &Marker) -> anyhow::Result<()> {
-    repoint(&marker.link, &marker.from_target)?;
+    repoint(paths, &marker.link, &marker.from_target)?;
     let backup = paths.backup_dir().join(&marker.from_version);
     for name in STATE_FILES {
         let saved = backup.join(name);
@@ -439,14 +601,33 @@ fn prune_versions(paths: &Paths, keep: &[&str]) {
 }
 
 /// Environment variable through which a core hands its lock file to the version it execs.
+#[cfg(unix)]
 pub const LOCK_FD_ENV: &str = "NEKORISU_LOCK_FD";
+
+/// Hands this core's place to `link daemon`. Unix: exec, passing the lock along so no other
+/// core can slip in between; returns only on failure. Windows has no exec: core lets go of
+/// the lock and exits with `supervise::RESTART`, and the login launcher that runs it starts
+/// the link again at once; never returns.
+pub fn hand_over(link: &Path, lock: Option<fs::File>) -> std::io::Error {
+    #[cfg(unix)]
+    {
+        exec_core(link, lock.as_ref())
+    }
+    #[cfg(not(unix))]
+    {
+        drop(lock);
+        eprintln!("{} core 退出，由启动器运行 {}", now_ms(), link.display());
+        std::process::exit(crate::supervise::RESTART)
+    }
+}
 
 /// Replaces this process with `link daemon`, passing the lock along so no other
 /// core can slip in between. Only returns on failure.
-pub fn exec_core(link: &Path, lock: Option<&fs::File>) -> std::io::Error {
+#[cfg(unix)]
+fn exec_core(link: &Path, lock: Option<&fs::File>) -> std::io::Error {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
-    let mut command = Command::new(link);
+    let mut command = std::process::Command::new(link);
     command.arg("daemon");
     match lock {
         Some(file) => {
@@ -483,9 +664,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Unix file mode; a no-op on Windows.
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -540,13 +730,33 @@ mod tests {
         base
     }
 
+    /// A release archive: `ARCHIVE_FILES` with `script` as the binary.
     fn tarball(script: &str) -> Vec<u8> {
+        let files: Vec<(&str, &[u8])> = ARCHIVE_FILES
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    if *name == BINARY_NAME {
+                        script.as_bytes()
+                    } else {
+                        b"launcher"
+                    },
+                )
+            })
+            .collect();
+        tar_of(&files)
+    }
+
+    fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
-        let mut header = tar::Header::new_gnu();
-        header.set_size(script.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        builder.append_data(&mut header, "nekorisu", script.as_bytes()).unwrap();
+        for (name, body) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *body).unwrap();
+        }
         builder.into_inner().unwrap().finish().unwrap()
     }
 
@@ -612,15 +822,25 @@ mod tests {
         let Outcome::Available(candidate) = check(&f.paths, &f.config, &f.roots).await.unwrap() else {
             panic!("expected an update");
         };
+        #[cfg(unix)]
         let binary = stage(&f.paths, &candidate).await.unwrap();
-        assert_eq!(binary, f.paths.versions_dir().join("99.0.0").join("nekorisu"));
+        #[cfg(windows)]
+        let binary = {
+            // A shell script can't run here, so the self-test refuses it; the rest is the same.
+            let binary = download(&f.paths, &candidate).await.unwrap();
+            assert!(self_test(&binary, "99.0.0").await.is_err());
+            assert!(binary.with_file_name(paths::LAUNCHER_NAME).is_file());
+            binary
+        };
+        assert_eq!(binary, f.paths.versions_dir().join("99.0.0").join(BINARY_NAME));
 
         // Pretend the install script put the current version in place.
-        let old = f.paths.versions_dir().join(VERSION).join("nekorisu");
+        let old = f.paths.versions_dir().join(VERSION).join(BINARY_NAME);
         fs::create_dir_all(old.parent().unwrap()).unwrap();
         fs::write(&old, "old").unwrap();
-        let link = f.paths.home.join("bin-nekorisu");
-        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let link = f.paths.home.join("bin").join(BINARY_NAME);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        repoint(&f.paths, &link, &old).unwrap();
         let config = UpdateConfig {
             link: Some(link.clone()),
             ..UpdateConfig::default()
@@ -629,7 +849,8 @@ mod tests {
 
         fs::write(f.paths.home.join("state.db"), "v1 state").unwrap();
         install(&f.paths, &link, &binary, "99.0.0").unwrap();
-        assert_eq!(fs::read_link(&link).unwrap(), binary);
+        assert_eq!(link_target(&f.paths, &link), Some(binary.clone()));
+        assert_eq!(fs::read(&link).unwrap(), fs::read(&binary).unwrap());
         assert!(f.paths.upgrade_marker().exists());
         assert!(f.paths.backup_dir().join(VERSION).join("state.db").exists());
         assert_eq!(State::load(&f.paths).available.as_deref(), Some("99.0.0"));
@@ -644,7 +865,7 @@ mod tests {
             panic!("expected an update");
         };
         assert!(stage(&f.paths, &candidate).await.is_err());
-        assert!(!f.paths.versions_dir().join("99.0.0").join("nekorisu").exists());
+        assert!(!f.paths.versions_dir().join("99.0.0").join(BINARY_NAME).exists());
     }
 
     #[tokio::test]
@@ -705,14 +926,15 @@ mod tests {
     #[test]
     fn rolls_back_after_repeated_failed_starts() {
         let paths = temp_home();
-        let old = paths.versions_dir().join("0.0.1").join("nekorisu");
-        let new = paths.versions_dir().join(VERSION).join("nekorisu");
-        for p in [&old, &new] {
+        let old = paths.versions_dir().join("0.0.1").join(BINARY_NAME);
+        let new = paths.versions_dir().join(VERSION).join(BINARY_NAME);
+        for (p, body) in [(&old, "old bin"), (&new, "new bin")] {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(p, "bin").unwrap();
+            fs::write(p, body).unwrap();
         }
-        let link = paths.home.join("bin-nekorisu");
-        std::os::unix::fs::symlink(&new, &link).unwrap();
+        let link = paths.home.join("bin").join(BINARY_NAME);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        repoint(&paths, &link, &new).unwrap();
         fs::create_dir_all(paths.backup_dir().join("0.0.1")).unwrap();
         fs::write(paths.backup_dir().join("0.0.1").join("state.db"), "old state").unwrap();
         fs::write(paths.home.join("state.db"), "migrated state").unwrap();
@@ -734,10 +956,96 @@ mod tests {
             panic!("expected a rollback")
         };
         assert_eq!(exec, link);
-        assert_eq!(fs::read_link(&link).unwrap(), old);
+        assert_eq!(link_target(&paths, &link), Some(old.clone()));
+        assert_eq!(fs::read_to_string(&link).unwrap(), "old bin");
         assert_eq!(fs::read_to_string(paths.home.join("state.db")).unwrap(), "old state");
         assert!(!paths.upgrade_marker().exists());
         assert!(State::load(&paths).bad_versions.contains(&VERSION.to_string()));
+    }
+
+    #[test]
+    fn unpacks_the_named_files_wherever_they_sit() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        let names = ["nekorisu.exe", "nekorisu-start.exe"];
+        fs::write(
+            &archive,
+            tar_of(&[
+                ("pkg/nekorisu.exe", b"bin"),
+                ("nekorisu-start.exe", b"launcher"),
+                ("README", b"other"),
+            ]),
+        )
+        .unwrap();
+        let out = dir.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        unpack(&archive, &out, &names).unwrap();
+        assert_eq!(fs::read(out.join("nekorisu.exe")).unwrap(), b"bin");
+        assert_eq!(fs::read(out.join("nekorisu-start.exe")).unwrap(), b"launcher");
+        assert!(!out.join("README").exists());
+
+        // The launcher is optional, the binary is not.
+        fs::write(&archive, tar_of(&[("nekorisu-start.exe", b"launcher")])).unwrap();
+        assert!(unpack(&archive, &out, &names).is_err());
+    }
+
+    /// The Windows link (hard link or copy plus pointer file), exercised on every system.
+    #[test]
+    fn copy_link_switches_versions_and_sets_the_old_binary_aside() {
+        let paths = temp_home();
+        let v1 = paths.versions_dir().join("0.0.1").join(BINARY_NAME);
+        let v2 = paths.versions_dir().join("0.0.2").join(BINARY_NAME);
+        for (p, body) in [(&v1, "one"), (&v2, "two")] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+            fs::write(p.with_file_name(paths::LAUNCHER_NAME), format!("launcher {body}")).unwrap();
+        }
+        let bin = paths.home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let link = bin.join(BINARY_NAME);
+        let launcher = bin.join(paths::LAUNCHER_NAME);
+        let aside = || {
+            fs::read_dir(&bin)
+                .unwrap()
+                .filter(|e| {
+                    let name = e.as_ref().unwrap().file_name();
+                    name.to_string_lossy().starts_with(&format!("{BINARY_NAME}.old-"))
+                })
+                .count()
+        };
+
+        repoint_copy(&paths, &link, &v1).unwrap();
+        assert_eq!(fs::read_to_string(&link).unwrap(), "one");
+        assert_eq!(copy_target(&paths, &link), Some(v1.clone()));
+        assert_eq!(aside(), 0, "nothing to set aside on a first install");
+        refresh_launcher(&paths, &link);
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "launcher one");
+
+        // The running binary is renamed aside, never written over.
+        let running = fs::File::open(&link).unwrap();
+        repoint_copy(&paths, &link, &v2).unwrap();
+        drop(running);
+        assert_eq!(fs::read_to_string(&link).unwrap(), "two");
+        assert_eq!(copy_target(&paths, &link), Some(v2.clone()));
+        assert_eq!(
+            fs::read_to_string(&v1).unwrap(),
+            "one",
+            "the version folder is untouched"
+        );
+        assert_eq!(aside(), 1);
+        assert!(!bin.join(format!("{BINARY_NAME}.nekorisu-new")).exists());
+        refresh_launcher(&paths, &link);
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "launcher two");
+
+        sweep_aside(&link);
+        assert_eq!(aside(), 0);
+
+        // A pointer written by PowerShell may carry a BOM and a line break.
+        fs::write(paths.current_pointer(), format!("\u{feff}{}\r\n", v1.display())).unwrap();
+        assert_eq!(copy_target(&paths, &link), Some(v1.clone()));
+        // No link, no installation, whatever the pointer says.
+        fs::remove_file(&link).unwrap();
+        assert_eq!(copy_target(&paths, &link), None);
     }
 
     #[test]

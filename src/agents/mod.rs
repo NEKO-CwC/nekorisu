@@ -67,7 +67,8 @@ pub enum FileRole {
 #[derive(Clone, Debug)]
 pub struct BundleFile {
     pub path: PathBuf,
-    /// Path relative to the agent's home directory.
+    /// Path relative to the agent's home directory, `/`-separated on every system: it becomes
+    /// part of what is stored, which must not depend on the uploading machine.
     pub rel: String,
     pub role: FileRole,
     pub size: u64,
@@ -134,7 +135,17 @@ pub(crate) fn mtime_ms(meta: &fs::Metadata) -> i64 {
 }
 
 pub(crate) fn relative(home: &Path, path: &Path) -> String {
-    path.strip_prefix(home).unwrap_or(path).to_string_lossy().into_owned()
+    match path.strip_prefix(home) {
+        Ok(inside) => slash_path(inside),
+        // Not under the home: kept as it was, rather than joining an absolute path's parts.
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
+/// A relative path written with `/` between its parts, whatever this system uses (`\` on Windows).
+pub(crate) fn slash_path(path: &Path) -> String {
+    let parts: Vec<_> = path.iter().map(|part| part.to_string_lossy()).collect();
+    parts.join("/")
 }
 
 /// Adds every file under `dir` to `files`. `role` gets the path inside `dir`.
@@ -144,10 +155,7 @@ pub(crate) fn add_dir(home: &Path, dir: &Path, files: &mut Vec<BundleFile>, role
     found.sort();
     for path in found {
         let Ok(meta) = fs::metadata(&path) else { continue };
-        let inner = path
-            .strip_prefix(dir)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let inner = path.strip_prefix(dir).map(slash_path).unwrap_or_default();
         files.push(BundleFile {
             rel: relative(home, &path),
             role: role(&inner),
@@ -226,6 +234,21 @@ mod tests {
 {"timestamp":"2000-03-01T00:00:01Z","text":"say \"timestamp\":\"x\""}
 "#;
         assert_eq!(last_timestamp(buf), Some(951_868_801_000));
+    }
+
+    #[test]
+    fn relative_paths_use_slashes_on_every_system() {
+        let home = Path::new("agent-home");
+        let file = home.join("projects").join("C--Users-x-proj").join("a.jsonl");
+        assert_eq!(relative(home, &file), "projects/C--Users-x-proj/a.jsonl");
+        let dir = home.join("projects").join("p").join("id");
+        let inner = dir.join("subagents").join("agent-1.jsonl");
+        assert_eq!(slash_path(inner.strip_prefix(&dir).unwrap()), "subagents/agent-1.jsonl");
+        #[cfg(windows)]
+        assert_eq!(
+            relative(Path::new(r"C:\h"), Path::new(r"C:\h\sessions\2026\11\01\r.jsonl")),
+            "sessions/2026/11/01/r.jsonl"
+        );
     }
 
     #[test]

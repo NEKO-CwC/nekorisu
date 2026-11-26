@@ -5,7 +5,7 @@
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -60,16 +60,17 @@ impl Server {
         let auth_owned = auth.map(|(u, p)| (u.to_string(), p.to_string()));
         let task = tokio::spawn({
             let (state, auth) = (state.clone(), auth_owned.clone());
+            let served = Arc::new((dir.path().to_path_buf(), prefix.to_string()));
             async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
                         return;
                     };
-                    let (dav, state, auth) = (dav.clone(), state.clone(), auth.clone());
+                    let (dav, state, auth, served) = (dav.clone(), state.clone(), auth.clone(), served.clone());
                     tokio::spawn(async move {
                         let service = service_fn(move |request| {
-                            let (dav, state, auth) = (dav.clone(), state.clone(), auth.clone());
-                            async move { Ok::<_, Infallible>(respond(&dav, &state, auth.as_ref(), request).await) }
+                            let (dav, state, auth, served) = (dav.clone(), state.clone(), auth.clone(), served.clone());
+                            async move { Ok::<_, Infallible>(respond(&dav, &state, auth.as_ref(), &served, request).await) }
                         });
                         let _ = http1::Builder::new()
                             .serve_connection(TokioIo::new(stream), service)
@@ -158,6 +159,7 @@ async fn respond(
     dav: &DavHandler,
     state: &State,
     auth: Option<&(String, String)>,
+    (root, prefix): &(PathBuf, String),
     request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
     if let Some(host) = request.headers().get("host").and_then(|h| h.to_str().ok()) {
@@ -189,6 +191,15 @@ async fn respond(
         .lock()
         .unwrap()
         .push((request.method().to_string(), request.uri().path().to_string()));
+    // MKCOL on a directory that exists: real servers (and dav-server elsewhere) answer 405, but on
+    // Windows dav-server's LocalFs reads the OS error code as a Unix one and answers 500.
+    if request.method().as_str() == "MKCOL" {
+        let path = crate::storage::decode(request.uri().path());
+        let inside = path.strip_prefix(prefix.as_str()).unwrap_or(&path).trim_matches('/');
+        if root.join(inside).is_dir() {
+            return Response::builder().status(405).body(Body::empty()).unwrap();
+        }
+    }
     dav.handle(request).await
 }
 

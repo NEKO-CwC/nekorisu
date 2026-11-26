@@ -1,10 +1,13 @@
 //! Storage passwords. On macOS they live in the login keychain, written
 //! and read through the `security` tool; elsewhere in `~/.nekorisu/secrets/<name>`
 //! (mode 0600). Never in config.toml, never logged, never printed.
+//!
+//! Windows uses the same file without Unix modes: it sits in the user's profile folder,
+//! which only the user, SYSTEM and Administrators can read. Credential Manager and DPAPI
+//! are not used because they fail in SSH sessions logged in with a key, where core may run.
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
@@ -41,6 +44,9 @@ pub fn load(paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
 pub fn place() -> &'static str {
     if cfg!(target_os = "macos") {
         "系统钥匙串"
+    } else if cfg!(windows) {
+        // The profile folder's own permissions: the user, SYSTEM and Administrators.
+        "~\\.nekorisu\\secrets\\（在你的用户文件夹里，只有你本人、系统和管理员能读）"
     } else {
         "~/.nekorisu/secrets/（只有你本人能读）"
     }
@@ -146,15 +152,17 @@ fn suffix(line: &str) -> String {
 fn file_store(paths: &Paths, name: &str, password: &str) -> anyhow::Result<()> {
     let dir = paths.secrets_dir();
     fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        options.mode(0o600);
+    }
     let tmp = dir.join(format!(".{name}.tmp"));
     let _ = fs::remove_file(&tmp);
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?
-        .write_all(password.as_bytes())?;
+    options.open(&tmp)?.write_all(password.as_bytes())?;
     fs::rename(&tmp, dir.join(name))?;
     Ok(())
 }
@@ -162,7 +170,10 @@ fn file_store(paths: &Paths, name: &str, password: &str) -> anyhow::Result<()> {
 fn file_load(paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
     match fs::read_to_string(paths.secrets_dir().join(name)) {
         // The file is written without a line break; one left by a hand edit is not part of the password.
-        Ok(text) => Ok(Some(text.strip_suffix('\n').unwrap_or(&text).to_string())),
+        Ok(text) => {
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            Ok(Some(text.strip_suffix('\r').unwrap_or(text).to_string()))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
@@ -205,6 +216,9 @@ mod tests {
 
     #[test]
     fn file_backend_round_trips_with_private_modes() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             home: dir.path().to_path_buf(),
@@ -213,9 +227,12 @@ mod tests {
         file_store(&paths, "nas", "synthetic pass").unwrap();
         file_store(&paths, "nas", "synthetic pass 2").unwrap(); // update in place
         assert_eq!(file_load(&paths, "nas").unwrap().as_deref(), Some("synthetic pass 2"));
-        let mode = |p: std::path::PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(paths.secrets_dir().join("nas")), 0o600);
-        assert_eq!(mode(paths.secrets_dir()), 0o700);
+        #[cfg(unix)]
+        {
+            let mode = |p: std::path::PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(paths.secrets_dir().join("nas")), 0o600);
+            assert_eq!(mode(paths.secrets_dir()), 0o700);
+        }
         assert!(
             fs::read_dir(paths.secrets_dir()).unwrap().count() == 1,
             "no temp file left"

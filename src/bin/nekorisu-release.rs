@@ -1,5 +1,5 @@
 //! Maintainers' release tool (docs/release.md). Not shipped to users: the
-//! release workflow packages only the `nekorisu` binary.
+//! release workflow packages only `nekorisu` (and, on Windows, `nekorisu-start.exe`).
 //!
 //!   keygen    make a key pair (root keys go to a password manager, the signing key to a CI secret)
 //!   certify   sign a signing-key certificate with a root key
@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -113,10 +112,11 @@ fn main() -> anyhow::Result<()> {
 
 fn keygen(out: &Path) -> anyhow::Result<()> {
     let key = SecretKey::generate();
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
         .open(out)
         .with_context(|| format!("建不了 {}（已经存在的话不会覆盖）", out.display()))?;
     file.write_all(key.to_file_json().as_bytes())?;

@@ -24,7 +24,11 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # Git Bash on Windows, so the steps below work everywhere
     env:
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
@@ -40,12 +44,20 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
-      - run: cargo build --release --locked --bin nekorisu --target ${{ matrix.target }}
-      - name: Package
+      # Windows also ships nekorisu-start.exe, the window-less launcher the login entry runs,
+      # and links the C runtime in, so no Visual C++ redistributable is needed.
+      - name: Build and package
         run: |
+          case "${{ matrix.target }}" in
+            *windows*)
+              bins="nekorisu nekorisu-start"; files="nekorisu.exe nekorisu-start.exe"
+              export RUSTFLAGS="-C target-feature=+crt-static" ;;
+            *) bins="nekorisu"; files="nekorisu" ;;
+          esac
+          cargo build --release --locked $(printf -- '--bin %s ' $bins) --target ${{ matrix.target }}
           mkdir pkg
-          cp "target/${{ matrix.target }}/release/nekorisu" pkg/
-          tar -C pkg -czf "nekorisu-${{ matrix.target }}.tar.gz" nekorisu
+          for f in $files; do cp "target/${{ matrix.target }}/release/$f" pkg/; done
+          tar -C pkg -czf "nekorisu-${{ matrix.target }}.tar.gz" $files
       - uses: actions/upload-artifact@v4
         with:
           name: nekorisu-${{ matrix.target }}
@@ -84,7 +96,7 @@ jobs:
             --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
             --dist dist --cert keys/release-cert.json --key-env NEKORISU_SIGNING_KEY
           ./target/debug/nekorisu-release verify "dist/$CHANNEL.json"
-          cp scripts/install.sh dist/
+          cp scripts/install.sh scripts/install.ps1 dist/
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

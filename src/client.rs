@@ -1,20 +1,22 @@
-//! Connecting a thin client (CLI, MCP, ...) to core over the Unix
-//! socket. If no core is running, start one in the background and wait for it.
+//! Connecting a thin client (CLI, MCP, ...) to core over the local socket or pipe (`ipc`).
+//!
+//! Clients never start core themselves. Keeping it running is the system's job: launchd on
+//! macOS, `systemd --user` on Linux, a scheduled task and its launcher on Windows
+//! (`autostart`). A client that can't reach core says so and points at that, rather than
+//! starting a core whose life would then hang on the client's (an agent may end its MCP
+//! server's whole process tree, or job, when it exits).
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use hyper_util::rt::TokioIo;
-use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
+use crate::ipc;
 use crate::paths::Paths;
 use crate::proto::core_client::CoreClient;
-use crate::proto::{HelloRequest, PROTOCOL_VERSION, ShutdownRequest};
-use crate::update;
+use crate::proto::{HelloRequest, HelloResponse, PROTOCOL_VERSION};
 
 pub type Client = CoreClient<Channel>;
 
@@ -22,105 +24,97 @@ const MAX_MESSAGE: usize = 64 << 20;
 
 pub async fn connect(kind: &str) -> anyhow::Result<Client> {
     let paths = Paths::from_env();
-    for attempt in 0..2 {
-        let mut client = match open(&paths.socket()).await {
-            Ok(client) => client,
-            Err(_) => start_and_open(&paths).await?,
-        };
-        let hello = client
-            .hello(HelloRequest {
-                protocol_version: PROTOCOL_VERSION,
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                client_kind: kind.to_string(),
-            })
-            .await
-            .context("core 没有回应握手")?
-            .into_inner();
-        if hello.protocol_version == PROTOCOL_VERSION {
-            return Ok(client);
-        }
-        if attempt == 0 {
-            // An older core is still running: ask it to exit, then start ours.
-            let _ = client.shutdown(ShutdownRequest {}).await;
-            wait_until_gone(&paths.socket()).await;
-        }
+    let Ok(mut client) = open(&paths).await else {
+        bail!(
+            "core 没在运行：可能还没启动，也可能意外退出了（日志在 {}）。启动它：nekorisu core start",
+            paths.core_log().display()
+        );
+    };
+    let hello = hello(&mut client, kind).await?;
+    if hello.protocol_version > PROTOCOL_VERSION {
+        bail!(
+            "core（{}）比这个程序新，协议对不上；重启 Agent 或重新打开终端，用新版本",
+            hello.core_version
+        );
     }
-    bail!("core 的协议版本和这个程序对不上，请运行 nekorisu core stop 后重试")
+    if hello.protocol_version < PROTOCOL_VERSION {
+        bail!(
+            "core（{}）比这个程序旧，协议对不上；运行 nekorisu core stop，再运行 nekorisu core start",
+            hello.core_version
+        );
+    }
+    Ok(client)
 }
 
-/// Connects only if a core is already running; never starts one.
+pub async fn hello(client: &mut Client, kind: &str) -> anyhow::Result<HelloResponse> {
+    let response = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            client_kind: kind.to_string(),
+        })
+        .await
+        .context("core 没有回应握手")?;
+    Ok(response.into_inner())
+}
+
+/// Connects only if a core is already running.
 pub async fn connect_existing() -> Option<Client> {
-    open(&Paths::from_env().socket()).await.ok()
+    open(&Paths::from_env()).await.ok()
 }
 
-async fn open(socket: &Path) -> anyhow::Result<Client> {
-    let socket = socket.to_path_buf();
-    // The URI is required but unused: the connector always dials the socket.
+async fn open(paths: &Paths) -> anyhow::Result<Client> {
+    let paths = paths.clone();
+    // The URI is required but unused: the connector always dials the local socket or pipe.
     let channel = Endpoint::try_from("http://[::]:50051")?
         .connect_with_connector(service_fn(move |_: Uri| {
-            let socket = socket.clone();
-            async move { Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(socket).await?)) }
+            let paths = paths.clone();
+            async move { Ok::<_, std::io::Error>(TokioIo::new(ipc::connect(&paths).await?)) }
         }))
         .await?;
     Ok(CoreClient::new(channel).max_decoding_message_size(MAX_MESSAGE))
 }
 
-async fn start_and_open(paths: &Paths) -> anyhow::Result<Client> {
-    spawn_core(paths)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        if let Ok(client) = open(&paths.socket()).await {
-            return Ok(client);
-        }
+/// Waits up to `limit` for core's process to be gone. Its socket or pipe goes a moment before
+/// the process does, and whoever restarts core next must not find the old one still holding
+/// the lock. False if it is still there.
+pub async fn wait_for_exit(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while process_exists(pid) {
         if Instant::now() > deadline {
-            bail!("core 没有启动起来，日志在 {}", paths.core_log().display());
-        }
-    }
-}
-
-fn spawn_core(paths: &Paths) -> anyhow::Result<()> {
-    std::fs::create_dir_all(paths.run_dir())?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.core_log())?;
-    let exe = core_executable(paths)?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("daemon")
-        .env_remove(update::LOCK_FD_ENV)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log));
-    // Its own process group, so the agent stopping its MCP server doesn't take core down.
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    command.spawn().context("启动不了 core")?;
-    Ok(())
-}
-
-/// Starts core through the install script's symlink when that is what we are
-/// running, so a later version switch (which repoints the link) takes effect.
-fn core_executable(paths: &Paths) -> anyhow::Result<PathBuf> {
-    let exe = std::env::current_exe().context("找不到自己的可执行文件")?;
-    let config = crate::config::load(paths).unwrap_or_default();
-    if let Some(link) = update::installed_link(paths, &config.update) {
-        let same = match (std::fs::canonicalize(&link), std::fs::canonicalize(&exe)) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        };
-        if same {
-            return Ok(link);
-        }
-    }
-    Ok(exe)
-}
-
-async fn wait_until_gone(socket: &Path) {
-    for _ in 0..100 {
-        if !socket.exists() {
-            return;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// Whether `pid` is still a process. A zombie counts, so on Unix this turns false only once its
+/// parent (launchd, systemd) has collected it and knows it is gone.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+
+    // SAFETY: plain Win32 calls; the handle, when there is one, is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            // Gone, or by now another account's process: core runs as this user.
+            return false;
+        }
+        let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+        CloseHandle(handle);
+        running
     }
 }

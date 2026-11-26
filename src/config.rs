@@ -30,7 +30,7 @@ pub struct UpdateConfig {
     pub channel: String,
     /// Tried before the built-in GitHub address; mirrors are safe because every file is signature-checked.
     pub urls: Vec<String>,
-    /// The symlink the install script made; defaults to ~/.local/bin/nekorisu.
+    /// The link the install script made; defaults to ~/.local/bin/nekorisu (nekorisu.exe on Windows).
     pub link: Option<std::path::PathBuf>,
 }
 

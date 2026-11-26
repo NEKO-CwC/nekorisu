@@ -1,30 +1,30 @@
 //! The resident core: holds local state, owns storage connections and
-//! the write queue, and serves the thin clients over a Unix socket. One core
-//! per user, guarded by a lock file.
+//! the write queue, and serves the thin clients over a Unix socket (a named pipe
+//! on Windows, see `ipc`). One core per user, guarded by a lock file.
 //!
 //! It also updates itself: a background task checks
 //! once a day, stages the new version, waits until no task is running, then the
 //! core stops serving and execs the new version in place, handing over its lock.
+//! Windows has no exec: there the old core lets go of the lock and exits, and the
+//! login launcher that runs it starts the new version (`supervise`).
+//!
+//! Core never starts itself again: launchd, systemd or that launcher do, after a failure.
 
 pub(crate) mod device;
 mod service;
 mod tasks;
 
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
 use rand_core::RngCore;
-use tokio::net::UnixListener;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
-use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
 use crate::config::{self, Config};
+use crate::ipc;
 use crate::paths::Paths;
 use crate::proto::core_server::CoreServer;
 use crate::timefmt::now_ms;
@@ -35,7 +35,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // A version that keeps failing to start gets swapped back before anything else runs.
     if let Startup::Exec(link) = update::on_core_start(&paths) {
-        let err = update::exec_core(&link, None);
+        let err = update::hand_over(&link, None);
         eprintln!("{} 启动不了旧版本 {}：{err}", now_ms(), link.display());
     }
 
@@ -53,17 +53,17 @@ pub async fn run() -> anyhow::Result<()> {
             .open(paths.lock())?,
     };
     if lock.try_lock().is_err() {
-        // Not an error: launchd / systemd may start one while a client-started core runs.
+        // Not an error, and exiting cleanly keeps the system from starting it again: a second
+        // start (the Windows task run once more, say) finds the first core running.
         eprintln!(
             "{} core 已经在运行（{}），这个不再启动",
             now_ms(),
-            paths.socket().display()
+            ipc::describe(&paths)
         );
         return Ok(());
     }
-    let socket = paths.socket();
-    let _ = fs::remove_file(&socket); // left over from a core that didn't exit cleanly
-    let listener = UnixListener::bind(&socket).with_context(|| format!("监听不了 {}", socket.display()))?;
+    let incoming = ipc::listen(&paths).await?;
+    update::tidy_install(&paths);
 
     let device = device::load_or_create(&paths)?;
     let config = config::load(&paths).unwrap_or_else(|err| {
@@ -74,11 +74,11 @@ pub async fn run() -> anyhow::Result<()> {
     let service = service::CoreService::new(paths.clone(), device, config, stop_tx);
     let idle = service.idle_probe();
     eprintln!(
-        "{} core {} 已启动，pid {}，socket {}",
+        "{} core {} 已启动，pid {}，监听 {}",
         now_ms(),
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
-        socket.display()
+        ipc::describe(&paths)
     );
     // Listening and configured: if this is a freshly installed version, the switch worked.
     update::confirm_started(&paths);
@@ -87,33 +87,64 @@ pub async fn run() -> anyhow::Result<()> {
     let handover_target = handover_rx.clone();
     tokio::spawn(auto_update(paths.clone(), idle, handover_tx));
 
-    let mut terminate = signal(SignalKind::terminate())?;
+    let stop_signal = stop_signal()?;
     Server::builder()
         .add_service(CoreServer::new(service).max_encoding_message_size(64 << 20))
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+        .serve_with_incoming_shutdown(incoming, async move {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
+                _ = stop_signal => {}
                 _ = stop_rx.changed() => {}
                 _ = handover_rx.changed() => {}
             }
         })
         .await?;
 
-    let _ = fs::remove_file(&socket);
+    ipc::after_shutdown(&paths);
     let handover = handover_target.borrow().clone();
     if let Some(link) = handover {
         eprintln!("{} core 交接给新版本", now_ms());
-        let err = update::exec_core(&link, Some(&lock));
-        eprintln!("{} 交接失败，core 退出，下次使用时再启动：{err}", now_ms());
+        let err = update::hand_over(&link, Some(lock));
+        // Exec failed. Exiting with an error has launchd or systemd start the link again.
+        anyhow::bail!("交接失败，core 退出，由系统重新启动：{err}");
     }
     eprintln!("{} core 已退出", now_ms());
     drop(lock);
     Ok(())
 }
 
+/// Resolves when the system asks core to stop: Ctrl-C or SIGTERM on Unix; Ctrl-C and the
+/// console's close, logoff and shutdown events on Windows. The shutdown RPC works everywhere.
+#[cfg(unix)]
+fn stop_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+#[cfg(windows)]
+fn stop_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
+    let (mut close, mut logoff, mut shutdown) = (ctrl_close()?, ctrl_logoff()?, ctrl_shutdown()?);
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = close.recv() => {}
+            _ = logoff.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    })
+}
+
 /// Takes over the lock an older core passed along when it exec'd this one.
+#[cfg(unix)]
 fn adopt_lock(paths: &Paths) -> Option<File> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     let fd: i32 = std::env::var(update::LOCK_FD_ENV).ok()?.parse().ok()?;
     // SAFETY: the previous core passed this descriptor on purpose; it is checked below
     // to be our lock file before use, and forgotten (not closed) otherwise.
@@ -133,6 +164,12 @@ fn adopt_lock(paths: &Paths) -> Option<File> {
             None
         }
     }
+}
+
+/// Windows passes no lock along: the old core lets go of it before starting the new one.
+#[cfg(not(unix))]
+fn adopt_lock(_paths: &Paths) -> Option<File> {
+    None
 }
 
 /// Checks once a day (first check 5–35 minutes after start) and switches to a
@@ -201,6 +238,16 @@ fn jitter(base: Duration, spread: Duration) -> Duration {
     base + Duration::from_millis(rand_core::OsRng.next_u64() % spread_ms)
 }
 
-fn make_private(dir: &Path) -> std::io::Result<()> {
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+/// Unix: only the owner may enter. Windows: a no-op; the profile folder is private already.
+pub(crate) fn make_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }

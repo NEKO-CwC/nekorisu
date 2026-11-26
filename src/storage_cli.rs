@@ -2,8 +2,7 @@
 //! config.toml, its password into the keychain, and neither passes through an Agent.
 //! These run in the CLI process itself; only the reload after `add` goes to core.
 
-use std::io::{self, BufRead, Write};
-use std::mem::MaybeUninit;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::IpAddr;
 
 use anyhow::{Context, bail};
@@ -96,7 +95,7 @@ async fn add(
         match core.reload_config(ReloadConfigRequest {}).await {
             Ok(_) => println!("已通知正在运行的 core 重新读配置"),
             Err(err) => eprintln!(
-                "没能通知 core 重新读配置（{}）；运行 nekorisu core stop 后再用",
+                "没能通知 core 重新读配置（{}）；运行 nekorisu core stop，再运行 nekorisu core start",
                 err.message()
             ),
         }
@@ -168,19 +167,19 @@ fn judge(status: u16) -> (bool, String) {
 /// A password from the terminal without echo, or, when stdin is not a terminal (scripts, pipes),
 /// one line from stdin. Never printed.
 fn read_password(prompt: &str) -> anyhow::Result<String> {
-    // SAFETY: isatty only inspects a file descriptor.
-    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    let interactive = io::stdin().is_terminal();
     let mut line = String::new();
     if interactive {
         eprint!("{prompt}");
         io::stderr().flush().ok();
-        let _echo_off = EchoOff::new(libc::STDIN_FILENO).context("没法关掉终端的回显，不在终端里输入密码")?;
+        let _echo_off = EchoOff::new().context("没法关掉终端的回显，不在终端里输入密码")?;
         let read = io::stdin().lock().read_line(&mut line);
         eprintln!(); // the Enter key was not echoed
         read.context("读不了输入")?;
     } else {
         io::stdin().lock().read_line(&mut line).context("读不了标准输入")?;
     }
+    // Lines end in \n, or \r\n on Windows.
     let password = line.strip_suffix('\n').unwrap_or(&line);
     let password = password.strip_suffix('\r').unwrap_or(password);
     if password.is_empty() {
@@ -189,18 +188,19 @@ fn read_password(prompt: &str) -> anyhow::Result<String> {
     Ok(password.to_string())
 }
 
-/// Turns terminal echo off while alive and restores it afterwards.
+/// Turns terminal echo off on stdin while alive and restores it afterwards.
+#[cfg(unix)]
 struct EchoOff {
-    fd: i32,
     saved: libc::termios,
 }
 
+#[cfg(unix)]
 impl EchoOff {
-    fn new(fd: i32) -> Option<Self> {
-        let mut term = MaybeUninit::<libc::termios>::uninit();
+    fn new() -> Option<Self> {
+        let mut term = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: `term` is a valid out-pointer; it is only read after tcgetattr says it filled it in.
         let saved = unsafe {
-            if libc::tcgetattr(fd, term.as_mut_ptr()) != 0 {
+            if libc::tcgetattr(libc::STDIN_FILENO, term.as_mut_ptr()) != 0 {
                 return None;
             }
             term.assume_init()
@@ -208,17 +208,52 @@ impl EchoOff {
         let mut quiet = saved;
         quiet.c_lflag &= !libc::ECHO;
         // SAFETY: `quiet` is a fully initialised termios copied from the terminal's own settings.
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &quiet) } != 0 {
             return None;
         }
-        Some(Self { fd, saved })
+        Some(Self { saved })
     }
 }
 
+#[cfg(unix)]
 impl Drop for EchoOff {
     fn drop(&mut self) {
         // SAFETY: restores exactly the settings `new` read from this descriptor.
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
+    }
+}
+
+/// Turns console echo off on stdin while alive and restores the console mode afterwards.
+#[cfg(windows)]
+struct EchoOff {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    saved: u32,
+}
+
+#[cfg(windows)]
+impl EchoOff {
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+        };
+        // SAFETY: GetStdHandle has no preconditions; the mode calls get a handle it returned
+        // and a valid out-pointer, and fail cleanly when it is not a console.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut saved = 0u32;
+            if GetConsoleMode(handle, &mut saved) == 0 || SetConsoleMode(handle, saved & !ENABLE_ECHO_INPUT) == 0 {
+                return None;
+            }
+            Some(Self { handle, saved })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: restores exactly the mode `new` read from this console handle.
+        unsafe { windows_sys::Win32::System::Console::SetConsoleMode(self.handle, self.saved) };
     }
 }
 

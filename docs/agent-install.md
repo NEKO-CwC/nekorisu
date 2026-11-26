@@ -48,7 +48,7 @@
 | MCP | 给 AI 接上的一个插头，接上以后 AI 才能调用 nekorisu |
 | skill | 给 AI 看的使用说明 |
 | 服务端 | 装在你自己服务器上的 nekorisu，能在一个地方看到所有电脑存进来的记录 |
-| 系统钥匙串 | 电脑自带的密码保险箱，密码放在那里，不放在普通文件里 |
+| 系统钥匙串 | 电脑自带的密码保险箱，密码放在那里，不放在普通文件里（Windows 上是你用户文件夹里的一个文件，只有你本人、系统和管理员能读） |
 | 印记 | 这次安装生成的 8 位校验码，最后用来核对 |
 
 **反例和正例：**
@@ -62,8 +62,9 @@
 
 ### 1. 开场白之后：了解对方，给出路线图
 
-- 开场白说完以后，自己查清楚：操作系统，你是哪个 Agent（Claude Code 还是 Codex），`~/.local/bin/nekorisu` 是不是已经装过。
-- 现在只支持 macOS 和 Linux。在 Windows 上，如实告诉他暂时还不支持，到此为止。
+- 开场白说完以后，自己查清楚：操作系统，你是哪个 Agent（Claude Code 还是 Codex），`~/.local/bin/nekorisu`（Windows 上是 `~\.local\bin\nekorisu.exe`）是不是已经装过。
+- 支持 macOS、Linux 和 64 位的 Windows 10 / 11（ARM64 的 Windows 用 x64 版，由系统仿真运行）。
+- **在 Windows 上**：Claude Code 的 Bash 工具跑在 Git Bash 里，下面的 bash 命令大多照样能用；Codex 用 PowerShell。和 macOS、Linux 不一样的地方，每一步都单独写了"Windows"的做法，没写的就照常做。`~` 指用户文件夹，也就是 `$env:USERPROFILE`。
 - 已经装过：告诉他，并把这次改成"检查和补齐"：缺哪样补哪样（MCP、skill、存储、服务端），已经好的不重复做。印记和回读验收照样可以做。
 - 问一个问题就够了：他有没有自己的网盘、NAS 或服务器。这决定后面哪些可选阶段要做。
 - 给一个简短的路线图：先安装 → 看看你电脑里有多少聊天记录（不上传）→ 接上你的存储（可选）→ 回读验收（可选）。告诉他大概几分钟，问"开始吗？"。
@@ -80,7 +81,17 @@
 
    不需要 sudo。它会核对下载文件的 SHA-256，装到 `~/.nekorisu/`，在 `~/.local/bin/nekorisu` 放一个链接，并让客户端开机自己启动。下载返回 404，说明还没有发布版：告诉用户，停下。
 
+   **Windows：** 用 PowerShell 的安装脚本。这一行在 PowerShell 和 Git Bash 里都能直接运行，不需要管理员权限：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/NEKO-CwC/nekorisu/releases/latest/download/install.ps1 | iex"
+   ```
+
+   它同样核对 SHA-256，装到 `~\.nekorisu\`，在 `~\.local\bin\` 放 `nekorisu.exe` 和运行 core 的 `nekorisu-start.exe`，注册一个登录时运行的计划任务并启动 core，并把 `~\.local\bin` 加进用户的 PATH（只对新打开的终端生效，所以你这边接着用完整路径）。
+
 2. 接上 MCP：Claude Code 用 `claude mcp add -s user nekorisu -- ~/.local/bin/nekorisu mcp`；Codex 用 `codex mcp add nekorisu -- ~/.local/bin/nekorisu mcp`。
+
+   **Windows：** 命令写完整的 Windows 路径，比如在 PowerShell 里：`claude mcp add -s user nekorisu -- "$env:USERPROFILE\.local\bin\nekorisu.exe" mcp`，Codex 是 `codex mcp add nekorisu -- "$env:USERPROFILE\.local\bin\nekorisu.exe" mcp`。在 Git Bash 里就把这个路径展开写出来，用单引号包住，免得 bash 吃掉反斜杠：`'C:\Users\<用户名>\.local\bin\nekorisu.exe'`。不要写成 `/c/Users/...`。
 
 3. 放好 skill：
 
@@ -89,6 +100,12 @@
    ```
 
    Codex 把两处 `~/.claude/skills` 换成 `~/.codex/skills`。
+
+   **Windows：** Git Bash 里上面这条照样能用。PowerShell 里（Codex 同样把 `.claude` 换成 `.codex`）：
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills\nekorisu" | Out-Null; curl.exe -fsSL https://raw.githubusercontent.com/NEKO-CwC/nekorisu/main/skills/nekorisu/SKILL.md -o "$env:USERPROFILE\.claude\skills\nekorisu\SKILL.md"
+   ```
 
 装好以后，生成**印记**：用这个会话的 ID 算一个 8 位的校验码。它只读一个环境变量、算一个哈希，不改文件、不联网。
 
@@ -100,13 +117,21 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 ```
 
 - 就用这一条，命令里不要直接写 `$变量`：那样会被权限检查拦下，用户要多点一次。没有 `shasum` 就用 `sha256sum`。
+- **Windows：** Git Bash 里照样用上面这条。在 PowerShell 里用下面这条，算出来的和上面那条一模一样；环境变量是空的，它什么都不输出（Codex 把两处 `CLAUDE_CODE_SESSION_ID` 换成 `CODEX_THREAD_ID`）：
+
+  ```powershell
+  if ($env:CLAUDE_CODE_SESSION_ID) { (-join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("nekorisu-hello:$env:CLAUDE_CODE_SESSION_ID")) | ForEach-Object { $_.ToString('x2') })).Substring(0, 8) }
+  ```
+
 - 用一句话告诉用户印记是多少、有什么用，比如"这次安装的印记是 3f9a1c27，最后验收时会再核对一次"。
-- 命令什么都没输出，说明拿不到会话 ID：如实说"这次生成不了印记"，回读验收就只比对开场白。**不要自己编一个。**
+- 命令什么都没输出，或者输出的是 `e3b0c442`（空输入的哈希，bash 那条在环境变量为空时就是这样），说明拿不到会话 ID：如实说"这次生成不了印记"，回读验收就只比对开场白。**不要自己编一个。**
 - 告诉用户：MCP 和 skill 要等 Agent 重启以后才生效，后面需要时再一起重启。
 
 ### 3. 先看一眼：扫描，不上传
 
-运行 `~/.local/bin/nekorisu scan`。用一句话讲清楚结果，比如"你的 Claude Code 里有 58 段聊天、1.2 GB，其中一些过几天会被它自己清理掉"。说明这一步没有上传任何东西。
+运行 `~/.local/bin/nekorisu scan`（Windows 的 PowerShell 里是 `& "$env:USERPROFILE\.local\bin\nekorisu.exe" scan`）。用一句话讲清楚结果，比如"你的 Claude Code 里有 58 段聊天、1.2 GB，其中一些过几天会被它自己清理掉"。说明这一步没有上传任何东西。
+
+报"core 没在运行"时：core 是在后台干活的进程，由系统在登录时启动并在出错后重启（macOS 是 launchd，Linux 是 `systemd --user`，Windows 是计划任务），nekorisu 的命令和 MCP 不会自己拉起它。运行 `nekorisu core start` 请系统启动它；提示还没注册开机自启，就运行 `nekorisu core enable`。没有 `systemd --user` 的 Linux（有些服务器、容器）上没有东西替它启动，照实告诉用户。
 
 ### 4. 接上你的存储（可选）
 
@@ -123,9 +148,21 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
     ```
 
   - Linux 桌面：`x-terminal-emulator -e ~/.local/bin/nekorisu storage login <名字>`，没有这个命令就用 `gnome-terminal -- …` 或 `konsole -e …`。没有图形界面的机器，请他在自己的终端里运行 `~/.local/bin/nekorisu storage login <名字>`。
+  - Windows：在 PowerShell 里运行下面这条。它会打开一个新的控制台窗口，等他输完、窗口关掉才返回；你的工具有时间限制的话，放到后台运行：
+
+    ```powershell
+    Start-Process -FilePath "$env:USERPROFILE\.local\bin\nekorisu.exe" -ArgumentList "storage","login","<名字>" -Wait
+    ```
+
+    Git Bash 里用单引号整个包起来，免得 bash 先把 `$env` 展开：
+
+    ```bash
+    powershell -NoProfile -Command 'Start-Process -FilePath "$env:USERPROFILE\.local\bin\nekorisu.exe" -ArgumentList "storage","login","<名字>" -Wait'
+    ```
 - **在后台等他输完。** 告诉他"输完回来就行"，然后用你的后台任务或监控能力等密码存好；没有这种能力，就每隔几秒查一次。最多等 5 分钟：
   - macOS：`security find-generic-password -s nekorisu-storage -a <名字> >/dev/null 2>&1` 成功，就说明存好了；
   - Linux：`test -f ~/.nekorisu/secrets/<名字>` 成功，就说明存好了。
+  - Windows：`~\.nekorisu\secrets\<名字>` 这个文件在了（PowerShell 里 `Test-Path "$env:USERPROFILE\.nekorisu\secrets\<名字>"`），就说明存好了。它放在用户文件夹里，只有他本人、系统和管理员能读。
 - 存好以后马上检查：`nekorisu storage test <名字>`，它只读，不写任何东西。
   - 返回 404：文件夹不存在，请他在网盘里先建好。
   - 返回 401：用户名或密码不对，再打开一次登录窗口。
@@ -176,7 +213,12 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 - **从远端取回：** 用服务端的 `list_sessions` 找到这个会话，用 `read_lines`（`kinds=["assistant"]`）在前面几十行里找第一条包含开场白那句话的助手消息。客户端自己的 `fetch` 在本机有原件时读的是本机，证明不了远端，不能当证据。
 - **比对：**
   - 取回的那条消息要和你当初说的一模一样，而且其中有手册开头那句开场白。比对开场白时，全角和半角标点算作相同，其余一个字都不能差。
-  - 在取回的记录里，找到当初告诉用户印记的那条消息，取出那 8 位印记，再重新算一次来比。用命令比，不要靠眼睛：`test "<取回的印记>" = "$(printenv CLAUDE_CODE_SESSION_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 | cut -c1-8)" && echo 一致 || echo 不一致`。
+  - 在取回的记录里，找到当初告诉用户印记的那条消息，取出那 8 位印记，再重新算一次来比。用命令比，不要靠眼睛：`test "<取回的印记>" = "$(printenv CLAUDE_CODE_SESSION_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 | cut -c1-8)" && echo 一致 || echo 不一致`。Windows 的 PowerShell 里用这条（Codex 换成 `CODEX_THREAD_ID`）：
+
+    ```powershell
+    if ('<取回的印记>' -eq (-join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("nekorisu-hello:$env:CLAUDE_CODE_SESSION_ID")) | ForEach-Object { $_.ToString('x2') })).Substring(0, 8)) { '一致' } else { '不一致' }
+    ```
+
 - **如实报告。** 都对上了，就说"从存储里取回的开场白和当初说的一字不差，印记也一致"。对不上，就说哪里不对、你确认了什么、还不确定什么，不要重试到对上为止。
 
 ### 7. 收尾：安装小结
@@ -185,7 +227,7 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 
 - 这次的印记；
 - 装了什么：客户端、MCP、skill，接了哪些可选项；
-- 东西放在哪：`~/.nekorisu/`、`~/.local/bin/nekorisu`、Agent 的 MCP 配置、skill 文件夹；
+- 东西放在哪：`~/.nekorisu/`、`~/.local/bin/nekorisu`（Windows 上还有 `nekorisu-start.exe`）、Agent 的 MCP 配置、skill 文件夹；
 - 本机有多少聊天记录，存了多少；
 - 以后怎么用：跟 Agent 说一句"帮我把最近的会话存起来"或者"找一下上周那段聊天"就行；
-- 怎么撤销：`claude mcp remove nekorisu`（还有 `nekorisu-server`）、删掉 skill 文件夹。客户端本身还没有卸载命令。
+- 怎么撤销：`nekorisu core disable` 取消开机自启，`claude mcp remove nekorisu`（还有 `nekorisu-server`），删掉 skill 文件夹。客户端本身还没有卸载命令。Windows 上安装脚本加进 PATH 的 `~\.local\bin`，可以在"编辑账户的环境变量"里删掉。

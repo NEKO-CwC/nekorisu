@@ -9,6 +9,7 @@ mod cli;
 mod client;
 mod config;
 mod daemon;
+mod ipc;
 mod linemap;
 mod mcp;
 mod paths;
@@ -17,6 +18,9 @@ mod render;
 mod secrets;
 mod storage;
 mod storage_cli;
+// Core uses only the restart code; the Windows login launcher, which includes it too, the rest.
+#[allow(dead_code)]
+mod supervise;
 #[cfg(test)]
 mod testdav;
 mod timefmt;
@@ -78,7 +82,7 @@ enum Command {
     },
     /// 以 MCP 服务器方式运行（stdio），给 Claude Code、Codex 用
     Mcp,
-    /// 运行常驻的 core（平时由 CLI 和 MCP 按需拉起）
+    /// 运行常驻的 core（平时由系统在登录时启动：nekorisu core enable）
     Daemon,
     /// 检查并更新到新版本（core 平时每天自己检查一次）
     Update {

@@ -59,11 +59,13 @@ pub struct FetchArgs {
 pub enum CoreAction {
     /// core 在不在运行
     Status,
-    /// 让 core 退出
+    /// 请系统启动 core（要先 nekorisu core enable）
+    Start,
+    /// 让 core 退出，等它退出完
     Stop,
-    /// 登录时自动启动 core（macOS 用 launchd，Linux 用 systemd --user）
+    /// 登录时自动启动 core，并且现在就启动（macOS 用 launchd，Linux 用 systemd --user，Windows 用计划任务）
     Enable,
-    /// 取消登录时自动启动
+    /// 取消登录时自动启动，并让 core 退出
     Disable,
 }
 
@@ -385,11 +387,12 @@ pub async fn update(check_only: bool) -> anyhow::Result<()> {
     println!("正在下载并核对……");
     let binary = update::stage(&paths, &candidate).await?;
     update::install(&paths, &link, &binary, &version)?;
-    if let Some(mut core) = running {
-        // Core exits; the next command starts the new version through the link.
-        core.shutdown(ShutdownRequest {}).await.map_err(rpc_error)?;
-    }
     println!("已更新到 {version}");
+    if let Some(mut core) = running {
+        // Core still runs the old version: stop it, and the system starts the new one through the link.
+        stop_core(&mut core).await?;
+        start_core().await?;
+    }
     Ok(())
 }
 
@@ -399,25 +402,12 @@ pub fn not_yet(what: &str) -> anyhow::Result<()> {
 
 pub async fn core(action: CoreAction) -> anyhow::Result<()> {
     match action {
-        CoreAction::Enable => return crate::autostart::enable(),
-        CoreAction::Disable => return crate::autostart::disable(),
-        _ => {}
-    }
-    let Some(mut core) = client::connect_existing().await else {
-        println!("core 没在运行");
-        return Ok(());
-    };
-    match action {
         CoreAction::Status => {
-            let hello = core
-                .hello(HelloRequest {
-                    protocol_version: proto::PROTOCOL_VERSION,
-                    client_version: env!("CARGO_PKG_VERSION").to_string(),
-                    client_kind: "cli".to_string(),
-                })
-                .await
-                .map_err(rpc_error)?
-                .into_inner();
+            let Some(mut core) = client::connect_existing().await else {
+                println!("core 没在运行");
+                return Ok(());
+            };
+            let hello = client::hello(&mut core, "cli").await?;
             println!(
                 "core {} 在运行：pid {}，{}启动，协议版本 {}，设备 {}",
                 hello.core_version,
@@ -427,12 +417,66 @@ pub async fn core(action: CoreAction) -> anyhow::Result<()> {
                 hello.device_id
             );
         }
-        CoreAction::Stop => {
-            core.shutdown(ShutdownRequest {}).await.map_err(rpc_error)?;
-            println!("已让 core 退出");
+        CoreAction::Start => {
+            if let Some(mut core) = client::connect_existing().await {
+                let hello = client::hello(&mut core, "cli").await?;
+                println!("core {} 已经在运行：pid {}", hello.core_version, hello.pid);
+                return Ok(());
+            }
+            start_core().await?;
         }
-        CoreAction::Enable | CoreAction::Disable => unreachable!("handled above"),
+        CoreAction::Stop => match client::connect_existing().await {
+            Some(mut core) => stop_core(&mut core).await?,
+            None => println!("core 没在运行"),
+        },
+        CoreAction::Enable => {
+            crate::autostart::enable()?;
+            // launchd and systemd have started it already; the Task Scheduler is asked here.
+            if cfg!(windows) && client::connect_existing().await.is_none() {
+                start_core().await?;
+            }
+        }
+        CoreAction::Disable => {
+            crate::autostart::disable()?;
+            // launchd and systemd stop it with the registration; on Windows it is stopped here.
+            if let Some(mut core) = client::connect_existing().await {
+                stop_core(&mut core).await?;
+            }
+        }
     }
+    Ok(())
+}
+
+/// Asks the system to start core (`autostart::start`), then waits until it answers.
+async fn start_core() -> anyhow::Result<()> {
+    crate::autostart::start()?;
+    // launchd holds a restart back for up to ten seconds after the previous start.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(mut core) = client::connect_existing().await {
+            let hello = client::hello(&mut core, "cli").await?;
+            println!("core {} 已启动：pid {}", hello.core_version, hello.pid);
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "已请系统启动 core，但 20 秒内没连上；日志在 {}",
+                Paths::from_env().core_log().display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Asks core to exit and waits until its process is gone, so whatever starts core next finds
+/// nothing in the way. Exiting this way counts as stopped: the system doesn't restart it.
+async fn stop_core(core: &mut client::Client) -> anyhow::Result<()> {
+    let pid = client::hello(core, "cli").await?.pid;
+    core.shutdown(ShutdownRequest {}).await.map_err(rpc_error)?;
+    if !client::wait_for_exit(pid, Duration::from_secs(30)).await {
+        bail!("已让 core 退出，但它 30 秒后还在收尾（pid {pid}）");
+    }
+    println!("core 已退出");
     Ok(())
 }
 

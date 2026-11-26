@@ -609,6 +609,13 @@ fn pick_file<'a>(session: &'a Session, file: &str) -> Result<&'a BundleFile, Sta
             .find(|f| f.path == session.main)
             .ok_or_else(|| Status::internal("找不到主记录"));
     }
+    // Stored paths use `/`; let a Windows user type `\` as well.
+    let file = if cfg!(windows) {
+        file.replace('\\', "/")
+    } else {
+        file.to_string()
+    };
+    let file = file.as_str();
     let suffix = format!("/{file}");
     let matches: Vec<&BundleFile> = session
         .files

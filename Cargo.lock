@@ -1342,6 +1342,7 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
