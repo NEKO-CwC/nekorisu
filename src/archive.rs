@@ -2,9 +2,10 @@
 //! layout of the archive format. Everything it writes is new and under `nekorisu/v1/`; nothing is
 //! overwritten or deleted.
 //!
-//! Per session: read this device's newest manifest, compare each local file with what
-//! that manifest recorded, and upload only what is new, as segments cut at line
-//! boundaries (a line still being written is left for next time). Segments and line
+//! Per session: read the manifest the local files last matched (this device's newest, or the
+//! one a restore put here), compare each local file with what that manifest recorded, and
+//! upload only what is new, as segments cut at line boundaries (a line still being written is
+//! left for next time). Segments and line
 //! maps go first, the manifest last, then one operations-log file for the whole run.
 //! Only structure is read from the files (sizes, line breaks, record types, a few
 //! metadata fields); nothing here looks at message content.
@@ -22,6 +23,7 @@ use crate::agents::{AgentKind, Discovery, FileRole, Session};
 use crate::daemon::device::Device;
 use crate::linemap::LineMap;
 use crate::storage::{Put, StorageError, Webdav};
+use crate::sync::{self, Rename};
 use crate::timefmt::now_ms;
 
 /// Everything this client writes lives under here.
@@ -111,7 +113,7 @@ struct LineMapFile {
 }
 
 #[derive(Serialize)]
-struct LogLine {
+pub(crate) struct LogLine {
     seq: u64,
     device: String,
     at_ms: i64,
@@ -137,6 +139,13 @@ pub struct Job {
     /// `<agent>:<id>` of the parent thread.
     pub parent: Option<String>,
     pub children: Vec<String>,
+}
+
+/// Where an archive run keeps what it uploaded: the records of this machine, and the storage
+/// they are about.
+pub struct SyncCtx<'a> {
+    pub records: &'a sync::Store,
+    pub storage: &'a str,
 }
 
 /// Progress, as it happens. The callback answers whether to go on; `false` (the task was
@@ -242,7 +251,13 @@ pub fn jobs_for(found: &[Discovery], wanted: &[(AgentKind, String)]) -> Vec<Job>
 
 /// Uploads `jobs`. A problem with one session's local files fails that session only; a problem
 /// with the storage stops the run (the rest is reported as not uploaded).
-pub async fn run(store: &Webdav, device: &Device, jobs: Vec<Job>, on: Progress<'_>) -> Outcome {
+pub async fn run(
+    store: &Webdav,
+    device: &Device,
+    ctx: Option<&SyncCtx<'_>>,
+    jobs: Vec<Job>,
+    on: Progress<'_>,
+) -> Outcome {
     enum Slot {
         Done(SessionReport),
         Plan(Box<SessionPlan>),
@@ -255,7 +270,7 @@ pub async fn run(store: &Webdav, device: &Device, jobs: Vec<Job>, on: Progress<'
             slots.push(Slot::Done(failure(&key, format!("没有上传：{why}"))));
             continue;
         }
-        match plan_session(store, device, job).await {
+        match plan_session(store, device, ctx, job).await {
             Ok(plan) => slots.push(Slot::Plan(Box::new(plan))),
             Err(err) => {
                 if err.downcast_ref::<StorageError>().is_some() {
@@ -290,9 +305,14 @@ pub async fn run(store: &Webdav, device: &Device, jobs: Vec<Job>, on: Progress<'
         };
         let key = session_key(plan.agent, &plan.id);
         if !plan.changed {
+            if let (Some(ctx), Some(prior)) = (ctx, &plan.prior)
+                && plan.record_manifest.as_deref() != Some(prior.id.as_str())
+            {
+                save_record(ctx, &plan, prior).await;
+            }
             outcome.sessions.push(SessionReport {
                 session: key,
-                manifest: plan.prior_id.clone(),
+                manifest: plan.prior.as_ref().map(|m| m.id.clone()),
                 files: plan.items.len(),
                 new_bytes: 0,
                 new_lines: 0,
@@ -315,7 +335,10 @@ pub async fn run(store: &Webdav, device: &Device, jobs: Vec<Job>, on: Progress<'
         .await;
         device_written = true;
         match result {
-            Ok(report) => {
+            Ok((report, plan, manifest)) => {
+                if let Some(ctx) = ctx {
+                    save_record(ctx, &plan, &manifest).await;
+                }
                 uploaded.push((
                     report.session.clone(),
                     report.manifest.clone().unwrap_or_default(),
@@ -335,11 +358,45 @@ pub async fn run(store: &Webdav, device: &Device, jobs: Vec<Job>, on: Progress<'
     if !uploaded.is_empty() {
         // What was written is real even if the task was cancelled meanwhile, so it is logged.
         on(Event::Committing);
-        if let Err(err) = write_log(store, device, &uploaded).await {
+        if let Err(err) = write_log(store, device, "archive", &uploaded).await {
             outcome.log_error = Some(format!("{err:#}"));
         }
     }
     outcome
+}
+
+/// Keeps what the local files now match. A record that cannot be written only costs the next
+/// status its accuracy, and the next upload falls back to this device's newest manifest.
+async fn save_record(ctx: &SyncCtx<'_>, plan: &SessionPlan, manifest: &Manifest) {
+    let locals = plan
+        .locals
+        .iter()
+        .map(|l| {
+            let copy = sync::LocalCopy {
+                path: l.path.clone(),
+                compressed: l.compressed,
+                line_based: l.line_based,
+            };
+            (l.uploaded.clone(), copy)
+        })
+        .collect();
+    let (storage, renames, manifest) = (ctx.storage.to_string(), plan.renames.clone(), manifest.clone());
+    let record =
+        tokio::task::spawn_blocking(move || sync::record(&storage, "archive", &manifest, renames, &locals)).await;
+    let saved = match record {
+        Ok(record) => ctx
+            .records
+            .save(plan.agent, &plan.id, &record)
+            .map_err(|e| e.to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    if let Err(err) = saved {
+        eprintln!(
+            "{} 记不下 {} 的上传状态：{err}",
+            now_ms(),
+            session_key(plan.agent, &plan.id)
+        );
+    }
 }
 
 /// The task was cancelled while uploading.
@@ -373,7 +430,12 @@ struct SessionPlan {
     agent: AgentKind,
     id: String,
     seq: u64,
-    prior_id: Option<String>,
+    /// The manifest the local files are compared with; the new one names it as its parent.
+    prior: Option<Manifest>,
+    /// The manifest this machine's record names, if any.
+    record_manifest: Option<String>,
+    renames: Vec<Rename>,
+    locals: Vec<LocalFile>,
     items: Vec<Item>,
     info: SessionInfo,
     links: Links,
@@ -422,7 +484,7 @@ impl LocalFile {
     }
 }
 
-fn local_files(session: &Session) -> Vec<LocalFile> {
+fn local_files(session: &Session, renames: &[Rename]) -> Vec<LocalFile> {
     let mut files: Vec<LocalFile> = session
         .files
         .iter()
@@ -430,12 +492,7 @@ fn local_files(session: &Session) -> Vec<LocalFile> {
             let compressed = f.rel.ends_with(".jsonl.zst");
             LocalFile {
                 path: f.path.clone(),
-                uploaded: f
-                    .rel
-                    .strip_suffix(".zst")
-                    .filter(|_| compressed)
-                    .unwrap_or(&f.rel)
-                    .to_string(),
+                uploaded: sync::stored_path(&f.rel, renames),
                 compressed,
                 role: f.role,
                 mtime_ms: f.mtime_ms,
@@ -460,17 +517,42 @@ fn role_name(role: FileRole) -> &'static str {
     }
 }
 
-fn session_dir(agent: &str, id: &str) -> String {
+pub(crate) fn session_dir(agent: &str, id: &str) -> String {
     format!("{ROOT}/sessions/{agent}/{id}")
 }
 
-async fn plan_session(store: &Webdav, device: &Device, job: Job) -> anyhow::Result<SessionPlan> {
+async fn plan_session(
+    store: &Webdav,
+    device: &Device,
+    ctx: Option<&SyncCtx<'_>>,
+    job: Job,
+) -> anyhow::Result<SessionPlan> {
     let session = &job.session;
     let dir = session_dir(session.agent.name(), &session.id);
-    let (seq, prior) = match latest_manifest(store, &dir, &device.id).await? {
-        Some((seq, manifest)) => (seq + 1, Some(manifest)),
-        None => (1, None),
+    let record = ctx.and_then(|c| {
+        c.records
+            .load(session.agent, &session.id)
+            .filter(|r| r.storage == c.storage)
+    });
+    let names = list_manifests(store, &dir).await?;
+    let own = newest_of(&names, &device.id);
+    let seq = own.map_or(1, |seq| seq + 1);
+    let mut prior = match own {
+        Some(seq) => Some(read_manifest(store, &dir, &format!("{}-{seq}", device.id)).await?),
+        None => None,
     };
+    // A restore put a version here (another device's, or an older one of this device): continue
+    // that one, unless this device has uploaded since.
+    if let Some(record) = &record
+        && names.contains(&record.manifest)
+        && prior
+            .as_ref()
+            .is_none_or(|own| own.id != record.manifest && own.created_at_ms < record.at_ms)
+    {
+        prior = Some(read_manifest(store, &dir, &record.manifest).await?);
+    }
+    let renames = record.as_ref().map(|r| r.renames.clone()).unwrap_or_default();
+    let locals = local_files(session, &renames);
     let mut recorded: HashMap<String, FileEntry> = prior
         .as_ref()
         .map(|m| m.files.iter().map(|f| (f.path.clone(), f.clone())).collect())
@@ -486,7 +568,7 @@ async fn plan_session(store: &Webdav, device: &Device, job: Job) -> anyhow::Resu
     let mut changed = prior.is_none();
     let mut rewrite = false;
     let mut new_bytes = 0;
-    for local in local_files(session) {
+    for local in locals.iter().cloned() {
         let record = recorded.remove(&local.uploaded);
         let (agent, is_main) = (session.agent, local.path == session.main);
         let (job_local, job_record) = (local.clone(), record.clone());
@@ -539,7 +621,10 @@ async fn plan_session(store: &Webdav, device: &Device, job: Job) -> anyhow::Resu
         agent: session.agent,
         id: session.id.clone(),
         seq,
-        prior_id: prior.map(|m| m.id),
+        prior,
+        record_manifest: record.map(|r| r.manifest),
+        renames,
+        locals,
         items,
         info,
         links: Links {
@@ -553,33 +638,37 @@ async fn plan_session(store: &Webdav, device: &Device, job: Job) -> anyhow::Resu
     })
 }
 
-/// This device's newest manifest of a session: `(its sequence number, its content)`.
-async fn latest_manifest(store: &Webdav, dir: &str, device: &str) -> anyhow::Result<Option<(u64, Manifest)>> {
-    let prefix = format!("{device}-");
-    let newest = store
+/// The ids of a session's manifests in the storage.
+pub(crate) async fn list_manifests(store: &Webdav, dir: &str) -> Result<Vec<String>, StorageError> {
+    Ok(store
         .list(&format!("{dir}/manifests"))
         .await?
         .into_iter()
         .filter(|e| !e.is_dir)
-        .filter_map(|e| {
-            let seq = e
-                .name
-                .strip_prefix(&prefix)?
-                .strip_suffix(".json")?
-                .parse::<u64>()
-                .ok()?;
-            Some(seq)
-        })
-        .max();
-    let Some(seq) = newest else { return Ok(None) };
-    let name = format!("{device}-{seq}");
-    let bytes = store.get(&format!("{dir}/manifests/{name}.json"), None).await?;
-    let manifest: Manifest =
-        serde_json::from_slice(&bytes).with_context(|| format!("上一份 manifest（{name}）读不懂，没有继续上传"))?;
-    if manifest.id != name {
-        bail!("manifest {name} 里记的 id 是 {}，对不上，没有继续上传", manifest.id);
+        .filter_map(|e| e.name.strip_suffix(".json").map(str::to_owned))
+        .collect())
+}
+
+/// The highest sequence number of `device` among manifest ids.
+fn newest_of(ids: &[String], device: &str) -> Option<u64> {
+    let prefix = format!("{device}-");
+    ids.iter()
+        .filter_map(|id| id.strip_prefix(&prefix)?.parse::<u64>().ok())
+        .max()
+}
+
+/// One manifest of a session, checked to be the one its name says.
+pub(crate) async fn read_manifest(store: &Webdav, dir: &str, id: &str) -> anyhow::Result<Manifest> {
+    let bytes = store.get(&format!("{dir}/manifests/{id}.json"), None).await?;
+    parse_manifest(&bytes, id)
+}
+
+pub(crate) fn parse_manifest(bytes: &[u8], id: &str) -> anyhow::Result<Manifest> {
+    let manifest: Manifest = serde_json::from_slice(bytes).with_context(|| format!("manifest {id} 读不懂"))?;
+    if manifest.id != id {
+        bail!("manifest {id} 里记的 id 是 {}，对不上", manifest.id);
     }
-    Ok(Some((seq, manifest)))
+    Ok(manifest)
 }
 
 struct Planned {
@@ -829,11 +918,19 @@ fn read_title(path: &Path, map: &LineMap) -> Option<String> {
 
 // ---- uploading ----
 
-async fn write_device(store: &Webdav, device: &Device) -> anyhow::Result<()> {
+/// Registers this device in the storage, once. Besides its id and name it says where things
+/// are on it (system, home folder, the agents' folders), so other devices can tell where its
+/// sessions belong on them (`pathmap`).
+pub(crate) async fn write_device(store: &Webdav, device: &Device) -> anyhow::Result<()> {
+    let text = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
     let body = serde_json::to_vec_pretty(&serde_json::json!({
         "id": device.id,
         "name": device.name,
         "created_at_ms": device.created_at_ms,
+        "os": std::env::consts::OS,
+        "home": text(crate::paths::home_dir()),
+        "claude_home": text(crate::paths::claude_home()),
+        "codex_home": text(crate::paths::codex_home()),
     }))?;
     // Written once: if an earlier run made it, that stays.
     let path = format!("{ROOT}/devices/{}.json", device.id);
@@ -844,7 +941,7 @@ async fn write_device(store: &Webdav, device: &Device) -> anyhow::Result<()> {
 }
 
 /// The only way anything is written: refuses a path outside `nekorisu/v1/`.
-async fn put(store: &Webdav, path: String, body: Vec<u8>) -> Result<Put, StorageError> {
+pub(crate) async fn put(store: &Webdav, path: String, body: Vec<u8>) -> Result<Put, StorageError> {
     if !path.starts_with(&format!("{ROOT}/")) {
         return Err(StorageError::Invalid(format!("不会写到 {ROOT}/ 以外的地方：{path}")));
     }
@@ -871,14 +968,14 @@ async fn put_addressed(store: &Webdav, path: String, body: Vec<u8>) -> Result<()
 async fn upload_session(
     store: &Webdav,
     device: &Device,
-    plan: SessionPlan,
+    mut plan: SessionPlan,
     on: Progress<'_>,
-) -> anyhow::Result<SessionReport> {
+) -> anyhow::Result<(SessionReport, SessionPlan, Manifest)> {
     let agent = plan.agent.name();
     let dir = session_dir(agent, &plan.id);
     let mut entries = Vec::new();
     let (mut new_bytes, mut new_lines) = (0, 0);
-    for item in plan.items {
+    for item in std::mem::take(&mut plan.items) {
         match item {
             Item::Keep(entry) => entries.push(entry),
             Item::Send { local, send } => {
@@ -896,12 +993,12 @@ async fn upload_session(
     let manifest = Manifest {
         format: MANIFEST_FORMAT.to_string(),
         id: id.clone(),
-        parent: plan.prior_id,
-        session: plan.info,
+        parent: plan.prior.as_ref().map(|m| m.id.clone()),
+        session: std::mem::take(&mut plan.info),
         device: device.id.clone(),
         created_at_ms: now_ms(),
         files: entries,
-        links: plan.links,
+        links: std::mem::take(&mut plan.links),
         rewrite: plan.rewrite,
         encryption: "none".to_string(),
     };
@@ -916,7 +1013,7 @@ async fn upload_session(
     if put == Put::Exists {
         bail!("manifest {id} 已经在存储里（同一台设备同时在上传？），没有覆盖它");
     }
-    Ok(SessionReport {
+    let report = SessionReport {
         session: session_key(plan.agent, &plan.id),
         manifest: Some(id),
         files,
@@ -925,7 +1022,8 @@ async fn upload_session(
         up_to_date: false,
         rewrite: plan.rewrite,
         error: None,
-    })
+    };
+    Ok((report, plan, manifest))
 }
 
 /// A stretch of a file to send: where it starts and ends in the file, and which lines it holds.
@@ -1114,8 +1212,14 @@ fn linemap_of(map: &LineMap, cut: &Cut, bytes: &[u8]) -> Option<LineMapFile> {
 
 // ---- the operations log ----
 
-/// One new file per run: `logs/<device>/<first seq>.jsonl`, one line per uploaded session.
-async fn write_log(store: &Webdav, device: &Device, uploaded: &[(String, String, u64)]) -> anyhow::Result<()> {
+/// One new file per run: `logs/<device>/<first seq>.jsonl`, one line per session, with what was
+/// done (`archive`, `restore`), the manifest and how many bytes moved.
+pub(crate) async fn write_log(
+    store: &Webdav,
+    device: &Device,
+    op: &'static str,
+    uploaded: &[(String, String, u64)],
+) -> anyhow::Result<()> {
     let dir = format!("{ROOT}/logs/{}", device.id);
     let first = next_log_seq(store, &dir).await?;
     let at_ms = now_ms();
@@ -1126,7 +1230,7 @@ async fn write_log(store: &Webdav, device: &Device, uploaded: &[(String, String,
             seq: first + i as u64,
             device: device.id.clone(),
             at_ms,
-            op: "archive",
+            op,
             sessions: vec![session.clone()],
             tags: Vec::new(),
             note: None,
@@ -1336,7 +1440,7 @@ mod tests {
 
     async fn archive(server: &Server, found: &[Discovery], wanted: &[(AgentKind, String)]) -> Outcome {
         let store = Webdav::new(server.spec()).unwrap();
-        run(&store, &device(), jobs_for(found, wanted), &|_| true).await
+        run(&store, &device(), None, jobs_for(found, wanted), &|_| true).await
     }
 
     fn manifest(server: &Server, dir: &str, seq: u64) -> Manifest {
@@ -1970,7 +2074,7 @@ mod tests {
             name: "other".into(),
             created_at_ms: 2,
         };
-        let outcome = run(&store, &other, jobs_for(&found, &wanted[..1]), &|_| true).await;
+        let outcome = run(&store, &other, None, jobs_for(&found, &wanted[..1]), &|_| true).await;
         assert_eq!(outcome.sessions[0].manifest.as_deref(), Some("dev-0002-1"));
         assert_eq!(
             manifest_names(&server, CLAUDE_DIR),
@@ -1994,7 +2098,14 @@ mod tests {
             }
             true
         };
-        let outcome = run(&store, &device(), jobs_for(&claude.discover(), &Claude::wanted()), &on).await;
+        let outcome = run(
+            &store,
+            &device(),
+            None,
+            jobs_for(&claude.discover(), &Claude::wanted()),
+            &on,
+        )
+        .await;
         let seen = *seen.lock().unwrap();
         assert_eq!(seen.0, outcome.sessions[0].new_bytes);
         assert_eq!(seen.1, seen.0);
@@ -2007,6 +2118,7 @@ mod tests {
         let outcome = run(
             &store,
             &device(),
+            None,
             jobs_for(&claude.discover(), &Claude::wanted()),
             &cancel,
         )
@@ -2032,7 +2144,7 @@ mod tests {
         // The first run is cancelled after its first segment: pieces are up, no manifest.
         let cancel = |event: Event| !matches!(event, Event::Uploaded { .. });
         let jobs = jobs_for(&claude.discover(), &Claude::wanted());
-        let outcome = run(&store, &device(), jobs.clone(), &cancel).await;
+        let outcome = run(&store, &device(), None, jobs.clone(), &cancel).await;
         assert!(outcome.sessions[0].error.is_some());
         assert!(manifest_names(&server, CLAUDE_DIR).is_empty());
         let before = server.puts();
@@ -2040,7 +2152,7 @@ mod tests {
         server.forget_requests();
 
         // The next run goes through: what is there already is refused as existing and kept.
-        let outcome = run(&store, &device(), jobs, &|_| true).await;
+        let outcome = run(&store, &device(), None, jobs, &|_| true).await;
         assert_eq!(outcome.failed(), 0, "{outcome:?}");
         assert!(
             server.puts().contains(&segment_before),

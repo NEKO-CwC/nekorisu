@@ -53,6 +53,39 @@ pub struct FetchArgs {
     /// 每行输出一个 JSON 对象
     #[arg(long)]
     pub json: bool,
+    /// 读存储里的哪个版本：manifest id，或 latest（最新上传的）；local 只读本机。不写：本机有就读本机，没有就读存储里最新的
+    #[arg(long)]
+    pub version: Option<String>,
+    /// 用哪个存储；只配了一个时不用写
+    #[arg(long)]
+    pub storage: Option<String>,
+}
+
+#[derive(Args)]
+pub struct VersionsArgs {
+    /// 会话：<agent>:<id>，或者只写 id
+    pub session: String,
+    /// 用哪个存储；只配了一个时不用写
+    #[arg(long)]
+    pub storage: Option<String>,
+    /// 输出 JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    /// 会话：<agent>:<id>，或者只写 id
+    pub session: String,
+    /// 恢复哪个版本（manifest id）；不写就是最新的，有好几个最新版本时会列出来让你选
+    #[arg(long)]
+    pub version: Option<String>,
+    /// 本机这份有存储里没有的内容时，仍用存储里的替换（本机这份移到 ~/.nekorisu/replaced/，不删）
+    #[arg(long)]
+    pub replace: bool,
+    /// 用哪个存储；只配了一个时不用写
+    #[arg(long)]
+    pub storage: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -132,11 +165,14 @@ pub async fn status(args: StatusArgs) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
+    for line in source_reminders(&mut core).await {
+        println!("{line}");
+    }
     let now = now_ms();
     for s in &response.sessions {
         let reference = s.session.as_ref().map(ref_text).unwrap_or_default();
         let upload = match &s.upload {
-            Some(u) if u.uploaded => format!("{}上传", ago(u.last_upload_ms, now)),
+            Some(u) if u.uploaded => upload_text(u, now),
             _ => "未上传".to_string(),
         };
         let mut notes = Vec::new();
@@ -175,6 +211,47 @@ pub async fn status(args: StatusArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the trusted source is waiting on, or asks for, that the person should hear about.
+/// Empty when there is no source or core does not know this call yet.
+pub async fn source_reminders(core: &mut client::Client) -> Vec<String> {
+    let Ok(state) = core.get_source_state(GetSourceStateRequest { quick: true }).await else {
+        return Vec::new();
+    };
+    let state = state.into_inner();
+    let mut out = Vec::new();
+    let pending = state.requests.iter().filter(|r| r.state == "pending").count();
+    if pending > 0 {
+        out.push(format!(
+            "来源 {} 有 {pending} 个请求等你本人在终端里确认：nekorisu source status",
+            state.name
+        ));
+    }
+    if !state.min_client_version.is_empty() {
+        out.push(format!(
+            "来源要求客户端至少是 {}，这台是 {}：nekorisu update",
+            state.min_client_version,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    out
+}
+
+/// "3 小时前上传，之后新增 12.0 KB、8 行", "1 天前上传，已是最新", plus a note when the
+/// uploaded part changed locally.
+fn upload_text(u: &UploadState, now: i64) -> String {
+    let mut text = format!("{}上传", ago(u.last_upload_ms, now));
+    if u.rewritten {
+        text.push_str("，本机文件改写过，下次整份重传");
+    } else if u.new_bytes == 0 {
+        text.push_str("，已是最新");
+    } else if u.new_lines > 0 {
+        text.push_str(&format!("，之后新增 {}、{} 行", human_bytes(u.new_bytes), u.new_lines));
+    } else {
+        text.push_str(&format!("，之后新增 {}", human_bytes(u.new_bytes)));
+    }
+    text
+}
+
 pub async fn fetch(args: FetchArgs) -> anyhow::Result<()> {
     let request = FetchRequest {
         session: Some(parse_ref(&args.session)?),
@@ -186,13 +263,17 @@ pub async fn fetch(args: FetchArgs) -> anyhow::Result<()> {
         kinds: args.kind.clone(),
         limit: args.limit,
         whole: args.whole,
-        version: String::new(),
+        version: args.version.clone().unwrap_or_default(),
+        storage: args.storage.clone().unwrap_or_default(),
     };
     let mut core = client::connect("cli").await?;
     let response = core.fetch(request).await.map_err(rpc_error)?.into_inner();
     if args.whole {
         println!("{}", response.path);
         return Ok(());
+    }
+    if response.version != "local" {
+        eprintln!("读的是存储里的版本 {}", response.version);
     }
     let bodies = render::read_spans(&response.path, &response.spans)?;
     for (span, body) in response.spans.iter().zip(&bodies) {
@@ -258,7 +339,19 @@ pub async fn run_archive(
     progress: bool,
     max_wait: Option<Duration>,
 ) -> anyhow::Result<Task> {
-    let mut task = core.archive(request).await.map_err(rpc_error)?.into_inner();
+    let task = core.archive(request).await.map_err(rpc_error)?.into_inner();
+    wait_task(core, task, progress, max_wait).await
+}
+
+/// Waits for a task in core, polling. `max_wait` of `None` waits until it is done; with a limit
+/// the task may come back still running. With `progress`, a terminal gets a "so far" line on
+/// stderr.
+pub async fn wait_task(
+    core: &mut client::Client,
+    mut task: Task,
+    progress: bool,
+    max_wait: Option<Duration>,
+) -> anyhow::Result<Task> {
     let show = progress && std::io::stderr().is_terminal();
     let started = Instant::now();
     while is_running(&task) {
@@ -273,7 +366,7 @@ pub async fn run_archive(
             .into_inner();
         if show && task.total_bytes > 0 {
             eprint!(
-                "\r  已传 {} / {}   ",
+                "\r  已传输 {} / {}   ",
                 human_bytes(task.done_bytes),
                 human_bytes(task.total_bytes)
             );
@@ -320,16 +413,123 @@ pub fn archive_lines(task: &Task) -> Vec<String> {
         .collect()
 }
 
-pub async fn restore(session: String) -> anyhow::Result<()> {
-    let session = Some(parse_ref(&session)?);
+pub async fn versions(args: VersionsArgs) -> anyhow::Result<()> {
     let mut core = client::connect("cli").await?;
-    core.restore(RestoreRequest {
-        session,
-        ..Default::default()
-    })
-    .await
-    .map_err(rpc_error)?;
+    let response = core
+        .versions(VersionsRequest {
+            session: Some(parse_ref(&args.session)?),
+            storage: args.storage.unwrap_or_default(),
+        })
+        .await
+        .map_err(rpc_error)?
+        .into_inner();
+    if args.json {
+        let rows: Vec<Value> = response.versions.iter().map(version_json).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    let now = now_ms();
+    let heads = response.versions.iter().filter(|v| v.head).count();
+    for v in &response.versions {
+        let device = if v.device_name.is_empty() {
+            &v.device
+        } else {
+            &v.device_name
+        };
+        println!(
+            "{}{}  设备 {device}  {}上传  最后一轮 {}  {}、主记录 {} 行{}",
+            if v.head { "* " } else { "  " },
+            v.id,
+            ago(v.created_at_ms, now),
+            ago(v.last_activity_ms, now),
+            human_bytes(v.bytes),
+            v.lines,
+            if v.parent.is_empty() {
+                String::new()
+            } else {
+                format!("  接着 {}", v.parent)
+            }
+        );
+    }
+    if heads > 1 {
+        println!("有 {heads} 个最新版本（标 *）：不同设备各自接着做过。恢复时用 --version 选一个。");
+    }
     Ok(())
+}
+
+pub fn version_json(v: &Version) -> Value {
+    json!({
+        "id": v.id,
+        "parent": v.parent,
+        "device": v.device,
+        "device_name": v.device_name,
+        "created_at_ms": v.created_at_ms,
+        "last_activity_ms": v.last_activity_ms,
+        "bytes": v.bytes,
+        "lines": v.lines,
+        "newest": v.head,
+    })
+}
+
+pub async fn restore(args: RestoreArgs) -> anyhow::Result<()> {
+    let request = RestoreRequest {
+        session: Some(parse_ref(&args.session)?),
+        version: args.version.unwrap_or_default(),
+        replace: args.replace,
+        storage: args.storage.unwrap_or_default(),
+    };
+    let mut core = client::connect("cli").await?;
+    let task = core.restore(request).await.map_err(rpc_error)?.into_inner();
+    let task = wait_task(&mut core, task, true, None).await?;
+    for line in restore_lines(&task) {
+        println!("{line}");
+    }
+    if !task.summary.is_empty() && task.state() == TaskState::Committed {
+        println!("{}", task.summary);
+    }
+    match task.state() {
+        TaskState::Committed => Ok(()),
+        _ if !task.error.is_empty() => bail!("{}", task.error),
+        _ => bail!("恢复没有完成"),
+    }
+}
+
+/// One line per session of a restore task's result, with how to go on.
+pub fn restore_lines(task: &Task) -> Vec<String> {
+    let rows: Vec<Value> = serde_json::from_str(&task.result_json).unwrap_or_default();
+    let mut out = Vec::new();
+    for row in &rows {
+        let session = row["session"].as_str().unwrap_or("?");
+        let count = |key: &str| row[key].as_u64().unwrap_or(0);
+        out.push(format!(
+            "{session}  版本 {}：{} 个文件新写入、{} 个补全、{} 个本来就一样",
+            row["manifest"].as_str().unwrap_or("-"),
+            count("written"),
+            count("completed"),
+            count("unchanged")
+        ));
+        if let Some(folder) = row["folder"].as_str() {
+            out.push(format!("  放在 Claude Code 的项目文件夹 {folder}"));
+        }
+        for path in row["replaced"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            out.push(format!("  本机原来那份移到了 {path}"));
+        }
+        if let Some(note) = row["note"].as_str() {
+            out.push(format!("  {note}"));
+        }
+        if let Some(resume) = row["resume"].as_str() {
+            match row["resume_in"].as_str() {
+                Some(dir) => out.push(format!("  接着做：在 {dir} 里运行 {resume}")),
+                None => out.push(format!("  接着做：{resume}")),
+            }
+        }
+    }
+    out
 }
 
 pub async fn doctor() -> anyhow::Result<()> {
@@ -341,7 +541,7 @@ pub async fn doctor() -> anyhow::Result<()> {
 /// `nekorisu update [--check]`.
 pub async fn update(check_only: bool) -> anyhow::Result<()> {
     let paths = Paths::from_env();
-    let config = crate::config::load(&paths)?;
+    let config = crate::cloud::effective_config(&paths)?;
     let roots = nekorisu::sign::embedded_root_keys();
     let candidate = match update::check(&paths, &config.update, &roots).await? {
         update::Outcome::UpToDate { latest } => {
@@ -576,6 +776,9 @@ pub fn status_json(s: &SessionStatus) -> Value {
         "children": s.children,
         "uploaded": upload.uploaded,
         "last_upload_ms": upload.last_upload_ms,
+        "new_bytes": upload.new_bytes,
+        "new_lines": upload.new_lines,
+        "rewritten": upload.rewritten,
         "cleanup_at_ms": s.cleanup_at_ms,
         "compressed": s.compressed,
         "archived_by_agent": s.archived_by_agent,

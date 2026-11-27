@@ -28,7 +28,7 @@ tar = "0.4.46"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "io-std", "sync", "signal", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 toml = "1"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4"] }
@@ -56,7 +56,17 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[[test]]
+# The features, written as scenarios in tests/e2e/features, run against the real binaries.
+name = "e2e"
+path = "tests/e2e/main.rs"
+harness = false
+
 [dev-dependencies]
+# Runs tests/e2e/features/*.feature (Gherkin, written in Chinese).
+cucumber = "0.23"
+# A terminal for the steps a person has to confirm (accept, allow-exec).
+portable-pty = "0.9"
 # In-process WebDAV server for the storage and archive tests.
 dav-server = { version = "0.12", default-features = false, features = ["localfs"] }
 hyper = { version = "1", features = ["http1", "server"] }

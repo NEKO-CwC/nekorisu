@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("cargo:rerun-if-changed={}", roots.display());
     println!("cargo:rustc-env=NEKORISU_ROOT_PUB_FILE={}", roots.display());
-    let descriptors = protox::compile(["nekorisu/v1/core.proto"], ["proto"])?;
+    let descriptors = protox::compile(["nekorisu/v1/core.proto", "nekorisu/cloud/v1/cloud.proto"], ["proto"])?;
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)

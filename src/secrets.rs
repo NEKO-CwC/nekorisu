@@ -1,6 +1,7 @@
-//! Storage passwords. On macOS they live in the login keychain, written
-//! and read through the `security` tool; elsewhere in `~/.nekorisu/secrets/<name>`
-//! (mode 0600). Never in config.toml, never logged, never printed.
+//! Storage passwords and trusted sources' tokens. On macOS they live in the login keychain,
+//! written and read through the `security` tool; elsewhere in `~/.nekorisu/secrets/<name>`
+//! (tokens in `secrets/source/<name>`, mode 0600). Never in config.toml, never logged, never
+//! printed.
 //!
 //! Windows uses the same file without Unix modes: it sits in the user's profile folder,
 //! which only the user, SYSTEM and Administrators can read. Credential Manager and DPAPI
@@ -8,6 +9,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
@@ -15,34 +17,73 @@ use anyhow::{Context, bail};
 use crate::config::check_storage_name;
 use crate::paths::Paths;
 
-/// Keychain service name; the account is the storage's name.
-const SERVICE: &str = "nekorisu-storage";
+/// What a secret opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A storage's password; the name is the storage's.
+    Storage,
+    /// A trusted source's token; the name is the source's.
+    Source,
+}
+
+impl Kind {
+    /// Keychain service name; the account is the name.
+    fn service(self) -> &'static str {
+        match self {
+            Kind::Storage => "nekorisu-storage",
+            Kind::Source => "nekorisu-source",
+        }
+    }
+
+    fn dir(self, paths: &Paths) -> PathBuf {
+        match self {
+            Kind::Storage => paths.secrets_dir(),
+            Kind::Source => paths.secrets_dir().join("source"),
+        }
+    }
+}
+
 /// `security` exits with this when the item is not in the keychain.
 const KEYCHAIN_NOT_FOUND: i32 = 44;
 
+/// The macOS keychain, unless a debug build is told `NEKORISU_SECRETS=file` (tests, so they
+/// leave nothing in the developer's keychain). Release builds never read the variable.
+fn keychain() -> bool {
+    cfg!(target_os = "macos") && !(cfg!(debug_assertions) && std::env::var("NEKORISU_SECRETS").as_deref() == Ok("file"))
+}
+
 pub fn store(paths: &Paths, name: &str, password: &str) -> anyhow::Result<()> {
-    check_storage_name(name)?;
-    check_password(password)?;
-    if cfg!(target_os = "macos") {
-        keychain_store(name, password)
-    } else {
-        file_store(paths, name, password)
-    }
+    store_kind(Kind::Storage, paths, name, password)
 }
 
 /// `None` when no password was ever stored for `name`.
 pub fn load(paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
+    load_kind(Kind::Storage, paths, name)
+}
+
+pub fn store_kind(kind: Kind, paths: &Paths, name: &str, secret: &str) -> anyhow::Result<()> {
     check_storage_name(name)?;
-    if cfg!(target_os = "macos") {
-        keychain_load(name)
+    check_password(secret)?;
+    if keychain() {
+        keychain_store(kind.service(), name, secret)
     } else {
-        file_load(paths, name)
+        file_store(paths, &kind.dir(paths), name, secret)
+    }
+}
+
+/// `None` when nothing was ever stored for `name`.
+pub fn load_kind(kind: Kind, paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
+    check_storage_name(name)?;
+    if keychain() {
+        keychain_load(kind.service(), name)
+    } else {
+        file_load(&kind.dir(paths), name)
     }
 }
 
 /// Where `store` puts the password, for the message after `storage login`.
 pub fn place() -> &'static str {
-    if cfg!(target_os = "macos") {
+    if keychain() {
         "系统钥匙串"
     } else if cfg!(windows) {
         // The profile folder's own permissions: the user, SYSTEM and Administrators.
@@ -72,9 +113,9 @@ const HEX_MARK: &str = "hex:";
 
 /// One `security -i` command. The password rides on stdin, so it never shows up in
 /// the process list. Inside double quotes only `\` and `"` need an escape.
-fn keychain_script(name: &str, value: &str) -> String {
+fn keychain_script(service: &str, name: &str, value: &str) -> String {
     let quoted = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("add-generic-password -U -s {SERVICE} -a {name} -w \"{quoted}\"\n")
+    format!("add-generic-password -U -s {service} -a {name} -w \"{quoted}\"\n")
 }
 
 /// What `keychain_load` makes of the text `security -w` printed.
@@ -86,7 +127,7 @@ fn from_keychain(printed: &str) -> String {
         .unwrap_or_else(|| printed.to_string())
 }
 
-fn keychain_store(name: &str, password: &str) -> anyhow::Result<()> {
+fn keychain_store(service: &str, name: &str, password: &str) -> anyhow::Result<()> {
     // Plain first (readable in Keychain Access), the hex form when plain does not come back intact.
     let hex_form = format!("{HEX_MARK}{}", hex::encode(password));
     let plain_may_work = password.is_ascii() && !password.starts_with(HEX_MARK);
@@ -107,10 +148,10 @@ fn keychain_store(name: &str, password: &str) -> anyhow::Result<()> {
             .stdin
             .take()
             .context("security 没有接住输入")?
-            .write_all(keychain_script(name, value).as_bytes())?;
+            .write_all(keychain_script(service, name, value).as_bytes())?;
         let output = child.wait_with_output()?;
         // In interactive mode `security` exits 0 even when the command failed, so look it up again.
-        if keychain_load(name)?.as_deref() == Some(password) {
+        if keychain_load(service, name)?.as_deref() == Some(password) {
             return Ok(());
         }
         let first = String::from_utf8_lossy(&output.stderr)
@@ -123,9 +164,9 @@ fn keychain_store(name: &str, password: &str) -> anyhow::Result<()> {
     bail!("没能把密码存进钥匙串（存进去的和输入的对不上）{}", suffix(&last_error))
 }
 
-fn keychain_load(name: &str) -> anyhow::Result<Option<String>> {
+fn keychain_load(service: &str, name: &str) -> anyhow::Result<Option<String>> {
     let output = Command::new("security")
-        .args(["find-generic-password", "-s", SERVICE, "-a", name, "-w"])
+        .args(["find-generic-password", "-s", service, "-a", name, "-w"])
         .stdin(Stdio::null())
         .output()
         .context("找不到 security 命令，没法用钥匙串")?;
@@ -149,17 +190,19 @@ fn suffix(line: &str) -> String {
 
 // ---- other systems: a private file ----
 
-fn file_store(paths: &Paths, name: &str, password: &str) -> anyhow::Result<()> {
-    let dir = paths.secrets_dir();
-    fs::create_dir_all(&dir)?;
+fn file_store(paths: &Paths, dir: &std::path::Path, name: &str, password: &str) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(paths.secrets_dir(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         options.mode(0o600);
     }
+    #[cfg(not(unix))]
+    let _ = paths;
     let tmp = dir.join(format!(".{name}.tmp"));
     let _ = fs::remove_file(&tmp);
     options.open(&tmp)?.write_all(password.as_bytes())?;
@@ -167,8 +210,8 @@ fn file_store(paths: &Paths, name: &str, password: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn file_load(paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
-    match fs::read_to_string(paths.secrets_dir().join(name)) {
+fn file_load(dir: &std::path::Path, name: &str) -> anyhow::Result<Option<String>> {
+    match fs::read_to_string(dir.join(name)) {
         // The file is written without a line break; one left by a hand edit is not part of the password.
         Ok(text) => {
             let text = text.strip_suffix('\n').unwrap_or(&text);
@@ -185,7 +228,7 @@ mod tests {
 
     #[test]
     fn keychain_script_keeps_the_password_out_of_argv_and_escapes_it() {
-        let script = keychain_script("nas", r#"p"a\ss w#rd"#);
+        let script = keychain_script("nekorisu-storage", "nas", r#"p"a\ss w#rd"#);
         assert_eq!(
             script,
             "add-generic-password -U -s nekorisu-storage -a nas -w \"p\\\"a\\\\ss w#rd\"\n"
@@ -202,7 +245,7 @@ mod tests {
         assert_eq!(from_keychain("hex:zz"), "hex:zz");
         assert_eq!(from_keychain("hex:abc"), "hex:abc");
         assert_eq!(from_keychain("hex:ff"), "hex:ff", "not UTF-8");
-        let script = keychain_script("nas", &hex_form);
+        let script = keychain_script("nekorisu-source", "nas", &hex_form);
         assert!(script.contains("-w \"hex:") && script.matches('\n').count() == 1);
     }
 
@@ -223,19 +266,36 @@ mod tests {
         let paths = Paths {
             home: dir.path().to_path_buf(),
         };
-        assert_eq!(file_load(&paths, "nas").unwrap(), None);
-        file_store(&paths, "nas", "synthetic pass").unwrap();
-        file_store(&paths, "nas", "synthetic pass 2").unwrap(); // update in place
-        assert_eq!(file_load(&paths, "nas").unwrap().as_deref(), Some("synthetic pass 2"));
+        let dir_of = |kind: Kind| kind.dir(&paths);
+        assert_eq!(file_load(&dir_of(Kind::Storage), "nas").unwrap(), None);
+        file_store(&paths, &dir_of(Kind::Storage), "nas", "synthetic pass").unwrap();
+        file_store(&paths, &dir_of(Kind::Storage), "nas", "synthetic pass 2").unwrap(); // update in place
+        assert_eq!(
+            file_load(&dir_of(Kind::Storage), "nas").unwrap().as_deref(),
+            Some("synthetic pass 2")
+        );
+        // A source's token of the same name is another secret.
+        assert_eq!(file_load(&dir_of(Kind::Source), "nas").unwrap(), None);
+        file_store(&paths, &dir_of(Kind::Source), "nas", "synthetic token").unwrap();
+        assert_eq!(
+            file_load(&dir_of(Kind::Source), "nas").unwrap().as_deref(),
+            Some("synthetic token")
+        );
+        assert_eq!(
+            file_load(&dir_of(Kind::Storage), "nas").unwrap().as_deref(),
+            Some("synthetic pass 2")
+        );
         #[cfg(unix)]
         {
             let mode = |p: std::path::PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(paths.secrets_dir().join("nas")), 0o600);
             assert_eq!(mode(paths.secrets_dir()), 0o700);
+            assert_eq!(mode(paths.secrets_dir().join("source")), 0o700);
+            assert_eq!(mode(paths.secrets_dir().join("source").join("nas")), 0o600);
         }
         assert!(
-            fs::read_dir(paths.secrets_dir()).unwrap().count() == 1,
-            "no temp file left"
+            fs::read_dir(paths.secrets_dir()).unwrap().count() == 2,
+            "the password, the source folder, no temp file left"
         );
     }
 }

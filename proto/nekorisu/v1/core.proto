@@ -18,6 +18,8 @@ service Core {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc Fetch(FetchRequest) returns (FetchResponse);
+  // The versions of a session in the storage, and which of them are the newest.
+  rpc Versions(VersionsRequest) returns (VersionsResponse);
 
   // Writes run as tasks: planned -> running -> pending commit -> committed,
   // or abandoned. The call returns at once;
@@ -35,6 +37,16 @@ service Core {
   rpc ListLog(ListLogRequest) returns (ListLogResponse);
   rpc PutDigest(PutDigestRequest) returns (Digest);
   rpc GetDigests(GetDigestsRequest) returns (GetDigestsResponse);
+
+  // The trusted source: ask it for a newer config now, or say what this
+  // device has from it.
+  rpc SyncSource(SyncSourceRequest) returns (SourceState);
+  rpc GetSourceState(GetSourceStateRequest) returns (SourceState);
+  // Accept or reject a request from the source. Only the CLI calls these, after the
+  // user confirmed in a terminal; the MCP server never does.
+  rpc AnswerSourceRequest(AnswerSourceRequestRequest) returns (SourceState);
+  // The "accept everything" switch, only ever turned on at this device.
+  rpc SetExec(SetExecRequest) returns (SourceState);
 }
 
 enum Agent {
@@ -72,6 +84,95 @@ message ReloadConfigRequest {}
 message ReloadConfigResponse {
   uint32 config_version = 1;
   string source = 2;  // "local" for now
+}
+
+message SyncSourceRequest {}
+
+message GetSourceStateRequest {
+  // Skip what is slow to find out (whether a token is stored).
+  bool quick = 1;
+}
+
+message AnswerSourceRequestRequest {
+  string id = 1;
+  bool accept = 2;
+}
+
+message SetExecRequest {
+  bool allowed = 1;
+  // The source's request this answers; empty when the user asked for it here.
+  string request_id = 2;
+}
+
+message SourceRequest {
+  string id = 1;
+  // "force" or "exec".
+  string kind = 2;
+  // "pending", "accepted" or "rejected".
+  string state = 3;
+  // force: the changes it asks for.
+  repeated SourceChange changes = 4;
+  // exec: "allow" or "revoke".
+  string action = 5;
+}
+
+message SourceChange {
+  string key = 1;
+  string value_json = 2;
+  // false: this version cannot apply it.
+  bool known = 3;
+}
+
+message AppliedValue {
+  string key = 1;
+  string value_json = 2;
+  // "local" (config.toml) or "source".
+  string origin = 3;
+  bool locked = 4;
+  bool has_other = 5;
+  string other_json = 6;
+}
+
+message SourceState {
+  // false: no source is set (nekorisu source add).
+  bool configured = 1;
+  string name = 2;
+  string url = 3;
+  repeated string key_ids = 4;
+  bool token_set = 5;
+  // The config in use; 0 = none yet.
+  uint64 applied_serial = 6;
+  string applied_issued_at = 7;
+  int64 checked_ms = 8;
+  // Why the last check failed; empty when it worked.
+  string error = 9;
+  // SyncSource only: "updated", "unchanged" or "failed".
+  string outcome = 10;
+  // The path rules this device applies, its own and the source's.
+  repeated AppliedPathMap paths = 11;
+  // Set when this client is older than the source asks for.
+  string min_client_version = 12;
+  // The source's requests aimed at this device.
+  repeated SourceRequest requests = 13;
+  bool exec_allowed = 14;
+  // Why the switch is the way it is.
+  string exec_why = 15;
+  // The values this device uses for keys both it and the source can set.
+  repeated AppliedValue values = 16;
+  // A local name to confirm with when turning the switch on without a request.
+  string device_name = 17;
+}
+
+message AppliedPathMap {
+  string from = 1;
+  // Empty: no rule for this `from` (the source dropped the device's own).
+  string to = 2;
+  // "local" (config.toml) or "source".
+  string origin = 3;
+  bool locked = 4;
+  // What the other side says, when both have a rule for this `from`.
+  bool has_other = 5;
+  string other = 6;
 }
 
 message ScanRequest {
@@ -121,12 +222,13 @@ message SessionStatus {
   bool archived_by_agent = 11;
 }
 
+// Compared with what this machine last uploaded or restored.
 message UploadState {
   bool uploaded = 1;
-  int64 last_upload_ms = 2;
-  uint64 new_bytes = 3;
-  uint64 new_lines = 4;
-  bool rewritten = 5;  // bytes uploaded last time changed locally
+  int64 last_upload_ms = 2;  // when that version was uploaded
+  uint64 new_bytes = 3;      // not uploaded: every byte
+  uint64 new_lines = 4;      // complete lines since; counted only once uploaded
+  bool rewritten = 5;        // bytes uploaded last time changed locally
 }
 
 message SearchRequest {
@@ -165,17 +267,43 @@ message FetchRequest {
   repeated string kinds = 4;     // "user", "assistant", "reasoning", "tool", "meta"; empty = all
   uint32 limit = 5;              // max lines; 0 = no limit
   bool whole = 6;                // only make the whole file available locally
-  string version = 7;            // manifest id; empty or "local" = the local original
+  // A manifest id, or "latest" for the newest upload; "local" = only the local original;
+  // empty = the local original if this machine has the session, else the newest upload.
+  string version = 7;
+  string storage = 8;            // storage name in config.toml; empty = the only one
 }
 
 message FetchResponse {
-  string path = 1;            // local file to read the bytes from
+  // Local file to read the bytes from. Read from the storage, it holds only the selected lines.
+  string path = 1;
   uint64 size = 2;            // bytes covered by this answer
   uint64 total_lines = 3;
   repeated LineSpan spans = 4;
   bool truncated = 5;         // more lines matched than `limit`
   string version = 6;         // "local" or a manifest id
   repeated string files = 7;  // transcripts in the bundle (relative paths)
+}
+
+message VersionsRequest {
+  SessionRef session = 1;
+  string storage = 2;  // empty = the only one
+}
+
+message VersionsResponse {
+  SessionRef session = 1;
+  repeated Version versions = 2;  // newest upload first
+}
+
+message Version {
+  string id = 1;  // manifest id
+  string parent = 2;
+  string device = 3;
+  string device_name = 4;
+  int64 created_at_ms = 5;
+  int64 last_activity_ms = 6;  // last record of the session in this version
+  uint64 bytes = 7;            // all files
+  uint64 lines = 8;            // main transcript
+  bool head = 9;               // no other version continues it: one of the newest
 }
 
 message LineSpan {
@@ -216,10 +344,13 @@ message ArchiveRequest {
   repeated string digest_ids = 3;
 }
 
+// Restores the session and its sub-agent threads. The task's result_json holds one object per
+// session: manifest, files written / completed / unchanged, replaced files, where it went, the
+// resume command, and for Codex whether it registered the thread.
 message RestoreRequest {
   SessionRef session = 1;
-  string version = 2;  // manifest id; empty = newest head
-  bool replace = 3;    // replace a local copy that differs
+  string version = 2;  // manifest id; empty = the newest (several: the call fails and lists them)
+  bool replace = 3;    // replace a local copy that has something the version lacks
   string storage = 4;
 }
 

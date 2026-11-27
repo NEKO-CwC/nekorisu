@@ -14,10 +14,10 @@ nekorisu 把会话原样存到用户自己选的存储里，需要时按行读�
 | MCP 工具 | 做什么 |
 |---|---|
 | `scan` | 本机有多少会话、多大 |
-| `status` | 每个会话多了什么、上次上传是多久前、会不会快被 Agent 自己清理 |
+| `status` | 每个会话上次上传是多久前、之后新增了多少、会不会快被 Agent 自己清理 |
 | `search` | 按关键词、时间、设备、Agent 找会话 |
-| `fetch` | 读一个会话：按行号，或按种类（`user` 人说的话、`assistant` 回复、`reasoning`、`tool`、`meta`）；`max_field_chars` 限制每个字段的长度；`whole` 整份下载到本地并返回路径 |
-| `restore` | 把会话原样放回 Agent 原来的目录，然后告诉用户 resume 命令 |
+| `fetch` | 读一个会话：按行号，或按种类（`user` 人说的话、`assistant` 回复、`reasoning`、`tool`、`meta`）；`max_field_chars` 限制每个字段的长度；`whole` 整份下载到本地并返回路径。本机没有的会话从存储里读（别的设备传上去的也行），`version` 指定读哪个版本 |
+| `restore` | 把存储里的会话原样放回本机 Agent 的目录（子 Agent 的会话一起），然后告诉用户怎么接着做 |
 | `archive` | 上传会话（子 Agent 的会话一起），可以附带 digest |
 | `digest` | 读、写、改 digest |
 | `log` | 追加或查看整理记录：标签、备注、"这几个会话是同一件事" |
@@ -28,6 +28,11 @@ nekorisu 把会话原样存到用户自己选的存储里，需要时按行读�
 
 - 什么时候读 digest、什么时候取几行、什么时候整份下载。顺序：先读 digest，再 `fetch` 用户说的话，确实需要再取更多。能少取就少取，长字段用 `max_field_chars` 截短。
 - 按本 skill 写 digest。
+
+## 只能用户本人做的
+
+- 工具的返回末尾可能有一行 `[nekorisu]` 开头的提醒，比如服务端发来了要确认的请求。把它转告用户，请他在自己的终端里运行 `nekorisu source status` 看看。
+- 接受服务端的强制覆盖（`nekorisu source accept`）、允许运行服务端的脚本（`nekorisu source allow-exec`）要用户本人在终端里确认。不要替他运行这两个命令，也不要想办法绕过终端确认。
 
 ## 先问用户的
 
@@ -40,7 +45,16 @@ nekorisu 把会话原样存到用户自己选的存储里，需要时按行读�
 1. `search` 找候选会话。
 2. 有 digest 就先读 digest。
 3. 没有，就 `fetch(kinds=["user"])` 只取用户说的话；要上下文再按行号取前后几行。
-4. 用户想原样接着做：`restore`，然后把 resume 命令告诉用户。
+4. 用户想原样接着做：按下一节恢复。
+
+## 拉过来接着做
+
+1. `restore(session)`。
+2. 如果回答说有好几个最新版本（几台设备各自接着做过），把列出来的版本（设备、上传时间、最后一轮的时间、大小）给用户看，让用户选一个，再用 `version` 恢复。不要替用户选。
+3. 如果回答说本机这份有存储里没有的内容，就停下告诉用户：建议先 `archive` 本机这份，两份都会留在存储里。用户坚持要用存储里的替换，才用 `replace=true` 再恢复；本机这份会移到 `~/.nekorisu/replaced/`，不会删掉。
+4. 恢复好了，告诉用户怎么接着做：
+   - Claude Code：`claude --resume <id>`；回答里给了文件夹（`resume_in`）就在那个文件夹里运行。在 Claude 桌面 App 里，在输入框里打 `/resume` 也能找到。
+   - Codex：`codex resume <id>`，或者在 Codex 的会话列表里找；桌面 App 可能要重开一下才出现。回答里说 Codex 没登记上时，把原因告诉用户。
 
 ## 整理并上传
 

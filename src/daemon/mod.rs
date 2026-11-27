@@ -73,6 +73,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let service = service::CoreService::new(paths.clone(), device, config, stop_tx);
     let idle = service.idle_probe();
+    service.follow_source();
     eprintln!(
         "{} core {} 已启动，pid {}，监听 {}",
         now_ms(),
@@ -190,7 +191,7 @@ async fn auto_update(paths: Paths, idle: impl Fn() -> bool, handover: watch::Sen
         if roots.is_empty() {
             continue; // no root keys built in yet: self-update is off
         }
-        let config = config::load(&paths).unwrap_or_default();
+        let config = crate::cloud::effective_config(&paths).unwrap_or_default();
         let candidate = match update::check(&paths, &config.update, &roots).await {
             Ok(Outcome::Available(candidate)) => candidate,
             Ok(Outcome::UpToDate { .. }) => continue,

@@ -198,6 +198,17 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 - 存储地址要和服务端读的是同一个，不然服务端看不到这里存进去的记录。
 - 重启以后调用一次服务端的 `list_devices`，确认真的连上了，再往下走。
 
+**让这台电脑从服务端取设置（可选）。** 服务端可以统一下发设置，比如恢复别的电脑上的会话时，工作目录换到这台电脑的哪里（路径映射）；这台电脑自己写的设置也会报给服务端，在 panel 里能看、能改。用一句话讲清楚，问他要不要。
+
+- 请他打开服务端 panel 的"配置"页，把页面上给出的那条 `nekorisu source add …` 命令复制给你（里面有服务端的地址和公钥），原样运行。公钥只能这样在本机设置，服务端改不了它。
+- **令牌在终端里输入，不经过你。** 令牌是服务端给设备用的那个（部署时设的 `NEKORISU_DEVICE_TOKEN`），不是 panel 的管理员密码。和存储密码一样，替他打开一个终端窗口，里面运行着 `~/.local/bin/nekorisu source login`（Windows 上 `-ArgumentList "source","login"`），他输完回来告诉你。
+- 在后台等他输完，最多 5 分钟：
+  - macOS：`security find-generic-password -s nekorisu-source -a <名字> >/dev/null 2>&1` 成功；`<名字>` 是 `source add` 后面那个，通常是 `home`；
+  - Linux：`test -f ~/.nekorisu/secrets/source/<名字>` 成功；
+  - Windows：`Test-Path "$env:USERPROFILE\.nekorisu\secrets\source\<名字>"` 为真。
+- 检查：`nekorisu source status`。看到"在用的配置：第 N 版"就是接上了；有"上次检查出错"就把原因告诉他。
+- 服务端发来的请求（强制改掉这台电脑锁定的设置、请这台电脑允许运行服务端的脚本）要**他本人在终端里**确认：`nekorisu source accept <请求ID>`、`nekorisu source allow-exec`，命令会让他再输入一次请求 ID。你没有终端，替不了他，也不要试。工具返回里提到有待确认的请求时，转告他运行 `nekorisu source status` 看看。
+
 ### 6. 回读验收（可选）
 
 意思是：把这段对话存进存储，再从远端把开场白取回来，看它是不是一个字都没变、印记对不对得上。需要接好存储和服务端。
@@ -226,7 +237,7 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 用一份简短的小结收尾：
 
 - 这次的印记；
-- 装了什么：客户端、MCP、skill，接了哪些可选项；
+- 装了什么：客户端、MCP、skill，接了哪些可选项（存储、服务端、从服务端取设置）；
 - 东西放在哪：`~/.nekorisu/`、`~/.local/bin/nekorisu`（Windows 上还有 `nekorisu-start.exe`）、Agent 的 MCP 配置、skill 文件夹；
 - 本机有多少聊天记录，存了多少；
 - 以后怎么用：跟 Agent 说一句"帮我把最近的会话存起来"或者"找一下上周那段聊天"就行；

@@ -32,8 +32,9 @@ service Cloud {
   // Fetch a resource a config refers to, by SHA-256, in chunks.
   rpc GetResource(GetResourceRequest) returns (stream ResourceChunk);
 
-  // Tell the source the device's config state. Never carries
-  // session content, paths or session IDs. Needs a token.
+  // Tell the source the device's config state. Never carries session
+  // content or session IDs; the only paths in it are the device's own
+  // [[paths.map]] rules. Needs a token.
   rpc ReportState(ReportStateRequest) returns (ReportStateResponse);
 }
 
@@ -100,6 +101,29 @@ message Config {
   // The table that decides a line's kind: user, assistant, reasoning, tool,
   // meta. Data.
   ResourceRef kind_rules = 12;
+  PathsConfig paths = 13;
+}
+
+// Where sessions from other devices go when restored (`[paths]` in config.toml).
+message PathsConfig {
+  // Tried before the device homes, longest `from` first.
+  repeated PathMap map = 1;
+}
+
+// A working directory that starts with `from` is taken to be `to` plus the rest.
+//
+// A device may have its own rule with the same `from` ([[paths.map]] in its
+// config.toml). Its own rule applies first; once the source changes this
+// rule, the source's applies, until the device's own rule changes again. A
+// rule the device locked always applies.
+message PathMap {
+  // A path as another device wrote it, e.g. "D:\\work" or "/home/me/src".
+  string from = 1;
+  // Where that is on the device. Empty: the device drops its own rule with
+  // this `from`.
+  string to = 2;
+  // Device IDs this is for. Empty = every device.
+  repeated string devices = 3;
 }
 
 // A resource fetched with GetResource.
@@ -203,6 +227,17 @@ message ReportStateRequest {
   // The newest config the device refused, so the source can show why a device
   // is behind. Unset when nothing was refused.
   ConfigFailure last_failure = 6;
+  // The [[paths.map]] rules written on this device, so the source can show
+  // them and change them (with a PathMap aimed at this device).
+  repeated LocalPathMap paths = 7;
+}
+
+message LocalPathMap {
+  string from = 1;
+  string to = 2;
+  // Locked on the device: a rule from the source with the same `from` does
+  // not apply.
+  bool locked = 3;
 }
 
 message LocalValue {

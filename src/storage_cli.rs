@@ -166,7 +166,7 @@ fn judge(status: u16) -> (bool, String) {
 
 /// A password from the terminal without echo, or, when stdin is not a terminal (scripts, pipes),
 /// one line from stdin. Never printed.
-fn read_password(prompt: &str) -> anyhow::Result<String> {
+pub(crate) fn read_password(prompt: &str) -> anyhow::Result<String> {
     let interactive = io::stdin().is_terminal();
     let mut line = String::new();
     if interactive {

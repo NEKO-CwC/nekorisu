@@ -48,6 +48,26 @@ impl Paths {
         self.home.join("cache")
     }
 
+    /// What was last uploaded or restored, per session (`sync`).
+    pub fn sync_dir(&self) -> PathBuf {
+        self.home.join("sync")
+    }
+
+    /// Copies of manifests read from the storage; they never change once written.
+    pub fn manifests_dir(&self) -> PathBuf {
+        self.home.join("manifests")
+    }
+
+    /// Where restore moves a local file it replaces, instead of deleting it.
+    pub fn replaced_dir(&self) -> PathBuf {
+        self.home.join("replaced")
+    }
+
+    /// Restore assembles files here before moving them into the agent's directory.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.home.join("staging")
+    }
+
     /// Storage passwords on systems without a keychain, one file each.
     pub fn secrets_dir(&self) -> PathBuf {
         self.home.join("secrets")

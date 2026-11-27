@@ -19,6 +19,48 @@ pub struct Config {
     pub signature: Option<String>,
     pub storage: BTreeMap<String, StorageConfig>,
     pub update: UpdateConfig,
+    pub paths: PathsConfig,
+    pub local: LocalConfig,
+    /// Keys set on this device that the trusted source's values do not override
+    /// (`nekorisu config set <key> <value> --lock`), e.g. `local.copy_form`. Path maps are
+    /// locked one by one instead (`lock = true`).
+    pub locked: Vec<String>,
+}
+
+/// `[paths]`: where sessions from other devices go on restore.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PathsConfig {
+    /// `[[paths.map]]`, tried before the device homes: a working directory that starts with
+    /// `from` is taken to be `to` plus the rest on this device.
+    pub map: Vec<PathMap>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct PathMap {
+    /// A path as another device wrote it, e.g. `D:\work` or `/home/me/src`.
+    pub from: String,
+    /// Where that is on this device.
+    pub to: String,
+    /// A rule from the trusted source with the same `from` does not apply while this is set.
+    #[serde(default)]
+    pub lock: bool,
+}
+
+/// `[local]`: what this device keeps of sessions it reads from the storage.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LocalConfig {
+    /// "pruned" (the default): only what the person said and the agent's replies are fetched
+    /// ahead, other lines when asked for. "full": whole segments. Restore always takes the
+    /// full original.
+    pub copy_form: String,
+}
+
+impl LocalConfig {
+    pub fn full_copies(&self) -> bool {
+        self.copy_form == "full"
+    }
 }
 
 /// `[update]`.
@@ -74,19 +116,41 @@ pub fn check_storage_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Writes `[storage.<name>]` into config.toml, keeping everything else (comments are lost: the
-/// file is parsed and written back). The old file is copied to `config.toml.bak` first.
+/// config.toml as plain TOML, or an empty table when there is none.
+pub fn load_table(paths: &Paths) -> anyhow::Result<toml::Table> {
+    let file = paths.config();
+    match fs::read_to_string(&file) {
+        Ok(text) => text
+            .parse::<toml::Table>()
+            .with_context(|| format!("{} 不是合法的 TOML，没有改动它", file.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Changes config.toml through `change`, keeping everything else (comments are lost: the file
+/// is parsed and written back). The old file is copied to `config.toml.bak` first. The result
+/// must still read as a config, or nothing is written.
+pub fn edit<T>(paths: &Paths, change: impl FnOnce(&mut toml::Table) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let file = paths.config();
+    let mut root = load_table(paths)?;
+    let out = change(&mut root)?;
+    let text = toml::to_string_pretty(&root)?;
+    toml::from_str::<Config>(&text).context("改完的 config.toml 读不了，没有写")?;
+    fs::create_dir_all(&paths.home)?;
+    if file.exists() {
+        fs::copy(&file, file.with_extension("toml.bak")).context("备份不了 config.toml")?;
+    }
+    let tmp = file.with_extension("toml.tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, &file)?;
+    Ok(out)
+}
+
+/// Writes `[storage.<name>]` into config.toml, keeping everything else (`edit`).
 /// Returns true if an entry with that name was replaced.
 pub fn save_storage(paths: &Paths, name: &str, storage: &StorageConfig) -> anyhow::Result<bool> {
     check_storage_name(name)?;
-    let file = paths.config();
-    let mut root = match fs::read_to_string(&file) {
-        Ok(text) => text
-            .parse::<toml::Table>()
-            .with_context(|| format!("{} 不是合法的 TOML，没有改动它", file.display()))?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(err) => return Err(err.into()),
-    };
     let mut entry = toml::Table::new();
     entry.insert("kind".into(), storage.kind.clone().into());
     entry.insert("url".into(), storage.url.clone().into());
@@ -96,22 +160,14 @@ pub fn save_storage(paths: &Paths, name: &str, storage: &StorageConfig) -> anyho
     if let Some(resolve) = &storage.resolve {
         entry.insert("resolve".into(), resolve.clone().into());
     }
-    let storages = root
-        .entry("storage")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .context("config.toml 里的 storage 应该是一张表")?;
-    let replaced = storages.insert(name.to_string(), toml::Value::Table(entry)).is_some();
-    let text = toml::to_string_pretty(&root)?;
-
-    fs::create_dir_all(&paths.home)?;
-    if file.exists() {
-        fs::copy(&file, file.with_extension("toml.bak")).context("备份不了 config.toml")?;
-    }
-    let tmp = file.with_extension("toml.tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(&tmp, &file)?;
-    Ok(replaced)
+    edit(paths, |root| {
+        let storages = root
+            .entry("storage")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("config.toml 里的 storage 应该是一张表")?;
+        Ok(storages.insert(name.to_string(), toml::Value::Table(entry)).is_some())
+    })
 }
 
 pub fn load(paths: &Paths) -> anyhow::Result<Config> {
@@ -125,6 +181,27 @@ pub fn load(paths: &Paths) -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_path_maps_and_copy_form() {
+        let config: Config = toml::from_str(
+            r#"
+            [local]
+            copy_form = "full"
+            [[paths.map]]
+            from = 'D:\work'
+            to = "/Users/me/work"
+            "#,
+        )
+        .unwrap();
+        assert!(config.local.full_copies());
+        assert_eq!(
+            (config.paths.map[0].from.as_str(), config.paths.map[0].to.as_str()),
+            (r"D:\work", "/Users/me/work")
+        );
+        assert!(!config.paths.map[0].lock, "not locked unless it says so");
+        assert!(!Config::default().local.full_copies());
+    }
 
     #[test]
     fn parses_storage_without_password() {

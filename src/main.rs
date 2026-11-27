@@ -7,22 +7,32 @@ mod archive;
 mod autostart;
 mod cli;
 mod client;
+mod cloud;
 mod config;
+mod config_cli;
 mod daemon;
 mod ipc;
 mod linemap;
 mod mcp;
+mod pathmap;
 mod paths;
 mod proto;
+mod remote;
 mod render;
+mod restore;
 mod secrets;
+mod settings;
+mod source_cli;
 mod storage;
 mod storage_cli;
+mod sync;
 // Core uses only the restart code; the Windows login launcher, which includes it too, the rest.
 #[allow(dead_code)]
 mod supervise;
 #[cfg(test)]
 mod testdav;
+#[cfg(test)]
+mod testsource;
 mod timefmt;
 mod update;
 
@@ -49,7 +59,7 @@ enum Command {
     },
     /// 每个会话的大小、最后活动时间和上传状态
     Status(cli::StatusArgs),
-    /// 按行读取一个会话
+    /// 按行读取一个会话（本机没有就读存储里的）
     Fetch(cli::FetchArgs),
     /// 搜索会话（开发中）
     Search { query: String },
@@ -62,8 +72,10 @@ enum Command {
         #[arg(long)]
         storage: Option<String>,
     },
-    /// 把会话放回 Agent 原来的目录（开发中）
-    Restore { session: String },
+    /// 存储里一个会话的各个版本，标出最新的
+    Versions(cli::VersionsArgs),
+    /// 把存储里的会话原样放回 Agent 的目录，接着做（子 Agent 的会话一起）
+    Restore(cli::RestoreArgs),
     /// 操作日志（开发中）
     Log,
     /// digest（开发中）
@@ -74,6 +86,16 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: storage_cli::StorageAction,
+    },
+    /// 可信来源（服务端）：add 设置地址和公钥、login 存令牌、sync 现在就取配置、status 看状态
+    Source {
+        #[command(subcommand)]
+        action: source_cli::SourceAction,
+    },
+    /// 这台设备自己的设置：set 设值（--lock 锁定，来源下发的不生效），unset 去掉
+    Config {
+        #[command(subcommand)]
+        action: config_cli::ConfigAction,
     },
     /// 管理常驻的 core
     Core {
@@ -116,7 +138,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Search { query } => cli::search(query).await,
         Command::Archive { sessions, storage } => cli::archive(sessions, storage).await,
         Command::Storage { action } => storage_cli::run(action).await,
-        Command::Restore { session } => cli::restore(session).await,
+        Command::Source { action } => source_cli::run(action).await,
+        Command::Config { action } => config_cli::run(action).await,
+        Command::Versions(args) => cli::versions(args).await,
+        Command::Restore(args) => cli::restore(args).await,
         Command::Log => cli::not_yet("log"),
         Command::Digest => cli::not_yet("digest"),
         Command::Doctor => cli::doctor().await,

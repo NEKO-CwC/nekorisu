@@ -35,6 +35,12 @@ pub fn load_or_create(paths: &Paths) -> anyhow::Result<Device> {
 }
 
 fn hostname() -> String {
+    // Windows' `hostname` takes no `-s`; the computer name is in the environment.
+    if cfg!(windows)
+        && let Some(name) = std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty())
+    {
+        return name.trim().to_string();
+    }
     std::process::Command::new("hostname")
         .arg("-s")
         .output()
