@@ -14,6 +14,8 @@ nekorisu 把你在 Claude Code、Codex 里的会话原样存到你自己选的�
 
 Agent 会先跟你打个招呼，再一步步带你装好。不懂的地方直接问它。存储密码在它替你打开的终端里输入，服务端在浏览器里登录，都不经过 Agent。
 
+自己部署了 [nekorisu 服务端](https://github.com/NEKO-CwC/nekorisu-server)，就把它的地址一起告诉 Agent。服务端的 `https://<地址>/connect` 不用登录就能看，写着怎么把电脑接上去；存储的地址和用户名，Agent 登录服务端以后自己去取，不用你找。
+
 想先看看它会做什么：[`docs/agent-install.md`](docs/agent-install.md)。
 
 支持 macOS、Linux 和 64 位的 Windows 10 / 11。在 Windows 上想自己装，在 PowerShell 里运行（不需要管理员权限）：
@@ -28,4 +30,4 @@ nekorisu 会在你给的存储地址下面自己建一个 `nekorisu/` 文件夹�
 
 - **普通 WebDAV（NAS、网盘）**：地址填你想放东西的那个文件夹。比如填 `https://dav.example.com/backup`，数据就在 `backup/nekorisu/v1/`。
 - **OpenList / Alist**：它的 `/dav` 根是虚拟的，只能写在挂载的存储里。先加一个挂载路径为 `/nekorisu` 的存储，地址填 `https://<你的 OpenList>/dav`，数据就直接在这个挂载里的 `v1/`。
-- **用了 [nekorisu 服务端](https://github.com/NEKO-CwC/nekorisu-server)**：服务端的 `NEKORISU_WEBDAV_URL` 要和这里填同一个地址。
+- **用了 [nekorisu 服务端](https://github.com/NEKO-CwC/nekorisu-server)**：服务端的 `NEKORISU_WEBDAV_URL` 要和这里填同一个地址。登录服务端的 panel，"存储"页上就写着电脑该填的地址和用户名。
