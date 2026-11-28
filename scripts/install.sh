@@ -58,7 +58,9 @@ else
 fi
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+# Fails unless the script got to its end: in macOS's sh, with an EXIT trap, a shell error such
+# as an unbound variable would otherwise leave the exit status 0.
+trap 'status=$?; rm -rf "$tmp"; if [ "$status" = 0 ] && [ "${finished:-}" != 1 ]; then status=1; fi; exit $status' EXIT
 
 say "下载 $asset ……"
 fetch "$BASE/$asset" "$tmp/$asset" || die "下载不了 $BASE/$asset"
@@ -87,7 +89,7 @@ mv -f "$tmp/unpack/nekorisu" "$dest/nekorisu"
 rm -f "$link.nekorisu-new"
 ln -s "$dest/nekorisu" "$link.nekorisu-new"
 mv -f "$link.nekorisu-new" "$link"
-say "已安装 nekorisu $version：$link → $dest/nekorisu"
+say "已安装 nekorisu ${version}：${link} → ${dest}/nekorisu"
 
 # A core from an earlier install keeps running the old version until it restarts.
 "$link" core stop >/dev/null 2>&1 || true
@@ -101,3 +103,4 @@ case ":$PATH:" in
   *) say "提示：$BIN_DIR 不在 PATH 里，把它加进 shell 的配置文件（比如 ~/.zshrc）：export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 say "下一步：nekorisu scan 看看本机有哪些会话"
+finished=1

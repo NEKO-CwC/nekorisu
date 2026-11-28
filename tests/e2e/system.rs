@@ -81,6 +81,16 @@ pub async fn install(device: &mut Device) -> anyhow::Result<String> {
     if !cfg!(target_os = "macos") {
         extra.push(("NEKORISU_NO_AUTOSTART", "1".into()));
     }
+    if cfg!(unix) {
+        // As in a person's terminal: macOS's sh reads names differently in a UTF-8 locale.
+        let utf8 = if cfg!(target_os = "macos") {
+            "en_US.UTF-8"
+        } else {
+            "C.UTF-8"
+        };
+        extra.push(("LANG", utf8.into()));
+        extra.push(("LC_ALL", utf8.into()));
+    }
     let mut command = if cfg!(windows) {
         extra.push(("NEKORISU_DOWNLOAD_BASE", release.clone().into()));
         let mut c = Command::new(powershell());

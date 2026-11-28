@@ -688,6 +688,33 @@ mod tests {
 
     use super::*;
 
+    /// macOS's `/bin/sh` (bash 3.2) in a UTF-8 locale takes a byte like the first one of "："
+    /// for part of a name: `$version：` was an unbound variable, and install.sh stopped before
+    /// registering login start (found 11-28). A variable right before a non-ASCII character
+    /// must be written `${name}`.
+    #[test]
+    fn install_script_braces_variables_before_other_characters() {
+        let script = include_str!("../scripts/install.sh");
+        for (n, line) in script.lines().enumerate() {
+            let bytes = line.as_bytes();
+            for (at, _) in line.match_indices('$') {
+                let name = &bytes[at + 1..];
+                if !name.first().is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+                    continue;
+                }
+                let len = name
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                    .count();
+                assert!(
+                    name.get(len).is_none_or(u8::is_ascii),
+                    "install.sh line {}: brace the variable: {line}",
+                    n + 1
+                );
+            }
+        }
+    }
+
     const DAY: i64 = 86_400_000;
 
     fn temp_home() -> Paths {
