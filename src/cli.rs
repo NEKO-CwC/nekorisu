@@ -648,7 +648,7 @@ pub async fn core(action: CoreAction) -> anyhow::Result<()> {
 }
 
 /// Asks the system to start core (`autostart::start`), then waits until it answers.
-async fn start_core() -> anyhow::Result<()> {
+pub async fn start_core() -> anyhow::Result<()> {
     crate::autostart::start()?;
     // launchd holds a restart back for up to ten seconds after the previous start.
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -670,7 +670,7 @@ async fn start_core() -> anyhow::Result<()> {
 
 /// Asks core to exit and waits until its process is gone, so whatever starts core next finds
 /// nothing in the way. Exiting this way counts as stopped: the system doesn't restart it.
-async fn stop_core(core: &mut client::Client) -> anyhow::Result<()> {
+pub async fn stop_core(core: &mut client::Client) -> anyhow::Result<()> {
     let pid = client::hello(core, "cli").await?.pid;
     core.shutdown(ShutdownRequest {}).await.map_err(rpc_error)?;
     if !client::wait_for_exit(pid, Duration::from_secs(30)).await {

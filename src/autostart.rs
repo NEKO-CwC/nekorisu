@@ -16,15 +16,48 @@ use crate::config;
 use crate::paths::{self, Paths};
 use crate::update;
 
+/// The launchd label. Debug builds given `NEKORISU_E2E_NAME` (end-to-end tests) use their own,
+/// so they never touch the developer's real registration; so do the two names below.
 #[cfg(unix)]
-const LABEL: &str = "io.github.neko-cwc.nekorisu";
+fn label() -> String {
+    match paths::test_name() {
+        Some(name) => format!("io.github.neko-cwc.nekorisu.e2e-{name}"),
+        None => "io.github.neko-cwc.nekorisu".to_string(),
+    }
+}
+
 #[cfg(unix)]
-const UNIT: &str = "nekorisu.service";
+fn unit() -> String {
+    match paths::test_name() {
+        Some(name) => format!("nekorisu-e2e-{name}.service"),
+        None => "nekorisu.service".to_string(),
+    }
+}
+
 /// The scheduled task's name, in the Task Scheduler's top folder.
 #[cfg_attr(unix, allow(dead_code))]
-const TASK: &str = "nekorisu";
-/// Passed through to core so it looks where the user's shell does.
-const PASS_ENV: &[&str] = &["NEKORISU_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+fn task() -> String {
+    match paths::test_name() {
+        Some(name) => format!("nekorisu-e2e-{name}"),
+        None => "nekorisu".to_string(),
+    }
+}
+
+/// Passed through to core so it looks where the user's shell does (and, in debug builds, keeps
+/// the test settings an end-to-end test started it with).
+fn pass_env() -> Vec<&'static str> {
+    let mut names = vec!["NEKORISU_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+    if cfg!(debug_assertions) {
+        names.extend([
+            "NEKORISU_E2E_NAME",
+            "NEKORISU_SECRETS",
+            "NEKORISU_UPDATE_FIRST_CHECK_SECS",
+            "NEKORISU_E2E_HOME",
+            "HOME",
+        ]);
+    }
+    names
+}
 
 /// Registers core to start at login. launchd and systemd also start it right away; on Windows
 /// that is `start`'s job.
@@ -52,6 +85,22 @@ pub fn disable() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where login start is registered, for messages.
+pub fn describe() -> String {
+    #[cfg(unix)]
+    {
+        if cfg!(target_os = "macos") {
+            format!("launchd：{}", launch_agent_path().display())
+        } else {
+            format!("systemd --user：{}", systemd_unit_path().display())
+        }
+    }
+    #[cfg(windows)]
+    {
+        format!("计划任务 {}", task())
+    }
+}
+
 /// Asks the system to start core now, the way it does at login.
 pub fn start() -> anyhow::Result<()> {
     if !registered() {
@@ -68,7 +117,7 @@ fn register(paths: &Paths, program: &Path) -> anyhow::Result<()> {
         fs::write(&plist, launchd_plist(program, &paths.core_log()))?;
         let domain = format!("gui/{}", uid());
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{domain}/{LABEL}")])
+            .args(["bootout", &format!("{domain}/{}", label())])
             .output();
         run(Command::new("launchctl").args(["bootstrap", &domain]).arg(&plist))?;
         println!("已注册开机自启：{}", plist.display());
@@ -77,7 +126,7 @@ fn register(paths: &Paths, program: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(unit.parent().expect("has a parent"))?;
         fs::write(&unit, systemd_unit(program, &paths.core_log()))?;
         run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-        run(Command::new("systemctl").args(["--user", "enable", "--now", UNIT]))?;
+        run(Command::new("systemctl").args(["--user", "enable", "--now", self::unit().as_str()]))?;
         println!("已注册开机自启：{}", unit.display());
     }
     Ok(())
@@ -88,18 +137,23 @@ fn unregister() -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let plist = launch_agent_path();
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{}/{LABEL}", uid())])
+            .args(["bootout", &format!("gui/{}/{}", uid(), label())])
             .output();
         if plist.exists() {
             fs::remove_file(&plist)?;
         }
     } else {
         let _ = Command::new("systemctl")
-            .args(["--user", "disable", "--now", UNIT])
+            .args(["--user", "disable", "--now", self::unit().as_str()])
             .output();
         let unit = systemd_unit_path();
         if unit.exists() {
             fs::remove_file(&unit)?;
+        }
+        // Left behind when `systemctl --user` could not be reached (no user session bus).
+        let wanted = unit.with_file_name("default.target.wants").join(self::unit());
+        if wanted.symlink_metadata().is_ok() {
+            fs::remove_file(&wanted)?;
         }
         let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
     }
@@ -107,7 +161,7 @@ fn unregister() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn registered() -> bool {
+pub fn registered() -> bool {
     if cfg!(target_os = "macos") {
         launch_agent_path().is_file()
     } else {
@@ -119,14 +173,14 @@ fn registered() -> bool {
 fn start_registered() -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let domain = format!("gui/{}", uid());
-        if run(Command::new("launchctl").args(["kickstart", &format!("{domain}/{LABEL}")])).is_err() {
+        if run(Command::new("launchctl").args(["kickstart", &format!("{domain}/{}", label())])).is_err() {
             // Registered but not loaded (say, after a bootout): loading starts it (RunAtLoad).
             run(Command::new("launchctl")
                 .args(["bootstrap", &domain])
                 .arg(launch_agent_path()))?;
         }
     } else {
-        run(Command::new("systemctl").args(["--user", "start", UNIT]))?;
+        run(Command::new("systemctl").args(["--user", "start", self::unit().as_str()]))?;
     }
     Ok(())
 }
@@ -152,13 +206,14 @@ fn register(paths: &Paths, program: &Path) -> anyhow::Result<()> {
         .flat_map(u16::to_le_bytes)
         .collect();
     fs::write(&file, utf16)?;
-    let created = run(schtasks().args(["/create", "/tn", TASK, "/f", "/xml"]).arg(&file));
+    let created = run(schtasks()
+        .args(["/create", "/tn", task().as_str(), "/f", "/xml"])
+        .arg(&file));
     let _ = fs::remove_file(&file);
     created.context("建不了登录时运行的计划任务")?;
-    println!("已注册开机自启：计划任务 {TASK}，登录时运行 {}", launcher.display());
-    let set: Vec<&str> = PASS_ENV
-        .iter()
-        .copied()
+    println!("已注册开机自启：计划任务 {}，登录时运行 {}", task(), launcher.display());
+    let set: Vec<&str> = pass_env()
+        .into_iter()
         .filter(|name| std::env::var_os(name).is_some())
         .collect();
     if !set.is_empty() {
@@ -173,15 +228,15 @@ fn register(paths: &Paths, program: &Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn unregister() -> anyhow::Result<()> {
     if registered() {
-        run(schtasks().args(["/delete", "/tn", TASK, "/f"])).context("删不了登录时运行的计划任务")?;
+        run(schtasks().args(["/delete", "/tn", task().as_str(), "/f"])).context("删不了登录时运行的计划任务")?;
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn registered() -> bool {
+pub fn registered() -> bool {
     schtasks()
-        .args(["/query", "/tn", TASK])
+        .args(["/query", "/tn", task().as_str()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -192,7 +247,7 @@ fn registered() -> bool {
 /// ours, whoever asks.
 #[cfg(windows)]
 fn start_registered() -> anyhow::Result<()> {
-    run(schtasks().args(["/run", "/tn", TASK])).context("计划任务启动不了 core")
+    run(schtasks().args(["/run", "/tn", task().as_str()])).context("计划任务启动不了 core")
 }
 
 #[cfg(windows)]
@@ -265,7 +320,7 @@ fn program(paths: &Paths) -> anyhow::Result<PathBuf> {
 fn launch_agent_path() -> PathBuf {
     paths::home_dir()
         .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist"))
+        .join(format!("{}.plist", label()))
 }
 
 #[cfg(unix)]
@@ -273,13 +328,13 @@ fn systemd_unit_path() -> PathBuf {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| paths::home_dir().join(".config"));
-    config.join("systemd/user").join(UNIT)
+    config.join("systemd/user").join(self::unit())
 }
 
 #[cfg(unix)]
 fn launchd_plist(program: &Path, log: &Path) -> String {
-    let env: String = PASS_ENV
-        .iter()
+    let env: String = pass_env()
+        .into_iter()
         .filter_map(|name| std::env::var(name).ok().map(|v| (name, v)))
         .map(|(name, value)| format!("    <key>{name}</key><string>{}</string>\n", xml_escape(&value)))
         .collect();
@@ -293,7 +348,7 @@ fn launchd_plist(program: &Path, log: &Path) -> String {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>{LABEL}</string>
+  <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{program}</string>
@@ -307,6 +362,7 @@ fn launchd_plist(program: &Path, log: &Path) -> String {
 {env}</dict>
 </plist>
 "#,
+        label = label(),
         program = xml_escape(&program.display().to_string()),
         log = xml_escape(&log.display().to_string()),
     )
@@ -314,8 +370,8 @@ fn launchd_plist(program: &Path, log: &Path) -> String {
 
 #[cfg(unix)]
 fn systemd_unit(program: &Path, log: &Path) -> String {
-    let env: String = PASS_ENV
-        .iter()
+    let env: String = pass_env()
+        .into_iter()
         .filter_map(|name| {
             std::env::var(name)
                 .ok()

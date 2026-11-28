@@ -27,6 +27,8 @@ name=nekorisu-e2e-$(random | cut -c1-8)
 docker run -d --rm --name "$name" \
   -p "127.0.0.1:$http_port:8080" -p "127.0.0.1:$grpc_port:7070" \
   -e NEKORISU_DEVICE_TOKEN="$token" \
+  -e NEKORISU_PUBLIC_URL="http://127.0.0.1:$http_port" \
+  -e NEKORISU_OAUTH_CLIENT_METADATA_DOCUMENTS=false \
   -v "$data:/data" -v "$config:/config" \
   "$image" >/dev/null
 

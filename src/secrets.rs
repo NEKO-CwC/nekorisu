@@ -27,11 +27,16 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Keychain service name; the account is the name.
-    fn service(self) -> &'static str {
-        match self {
-            Kind::Storage => "nekorisu-storage",
-            Kind::Source => "nekorisu-source",
+    /// Keychain service name; the account is the name. End-to-end tests (debug builds with
+    /// `NEKORISU_E2E_NAME`) get services of their own.
+    fn service(self) -> String {
+        let kind = match self {
+            Kind::Storage => "storage",
+            Kind::Source => "source",
+        };
+        match crate::paths::test_name() {
+            Some(name) => format!("nekorisu-e2e-{name}-{kind}"),
+            None => format!("nekorisu-{kind}"),
         }
     }
 
@@ -65,7 +70,7 @@ pub fn store_kind(kind: Kind, paths: &Paths, name: &str, secret: &str) -> anyhow
     check_storage_name(name)?;
     check_password(secret)?;
     if keychain() {
-        keychain_store(kind.service(), name, secret)
+        keychain_store(&kind.service(), name, secret)
     } else {
         file_store(paths, &kind.dir(paths), name, secret)
     }
@@ -75,7 +80,7 @@ pub fn store_kind(kind: Kind, paths: &Paths, name: &str, secret: &str) -> anyhow
 pub fn load_kind(kind: Kind, paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
     check_storage_name(name)?;
     if keychain() {
-        keychain_load(kind.service(), name)
+        keychain_load(&kind.service(), name)
     } else {
         file_load(&kind.dir(paths), name)
     }
@@ -85,10 +90,55 @@ pub fn load_kind(kind: Kind, paths: &Paths, name: &str) -> anyhow::Result<Option
 pub fn delete_kind(kind: Kind, paths: &Paths, name: &str) -> anyhow::Result<()> {
     check_storage_name(name)?;
     if keychain() {
-        keychain_delete(kind.service(), name)
+        keychain_delete(&kind.service(), name)
     } else {
         file_delete(&kind.dir(paths), name)
     }
+}
+
+/// Whether the keychain holds anything of ours, under any name (`nekorisu uninstall`). Always
+/// false where secrets are files: those go with `~/.nekorisu`.
+pub fn any_in_keychain() -> bool {
+    keychain()
+        && [Kind::Storage, Kind::Source].iter().any(|kind| {
+            Command::new("security")
+                .args(["find-generic-password", "-s", &kind.service()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+}
+
+/// Deletes everything of ours from the keychain, whatever its name, including names config.toml
+/// no longer has. How many items went.
+pub fn forget_keychain() -> anyhow::Result<usize> {
+    if !keychain() {
+        return Ok(0);
+    }
+    let mut gone = 0;
+    for kind in [Kind::Storage, Kind::Source] {
+        // One item per call; a bound in case `security` keeps saying yes without deleting.
+        for _ in 0..200 {
+            let output = Command::new("security")
+                .args(["delete-generic-password", "-s", &kind.service()])
+                .stdin(Stdio::null())
+                .output()
+                .context("找不到 security 命令，没法用钥匙串")?;
+            if output.status.code() == Some(KEYCHAIN_NOT_FOUND) {
+                break;
+            }
+            if !output.status.success() {
+                bail!(
+                    "没能从钥匙串删掉（security 退出码 {}）",
+                    output.status.code().unwrap_or(-1)
+                );
+            }
+            gone += 1;
+        }
+    }
+    Ok(gone)
 }
 
 /// Where `store` puts the password, for the message after `storage login`.

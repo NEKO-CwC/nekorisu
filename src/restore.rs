@@ -99,6 +99,10 @@ pub struct SessionRow {
     pub note: Option<String>,
 }
 
+/// How a restore that stopped because the local copy has more begins (`nekorisu uninstall`
+/// tells that apart from a failure).
+pub const CONFLICT_LEAD: &str = "本机这份有存储里这个版本没有的内容";
+
 #[derive(Debug, Default)]
 pub struct Outcome {
     pub sessions: Vec<SessionRow>,
@@ -266,7 +270,7 @@ async fn restore_staged(
         };
         let first = plans.first().map(|p| session_key(p.agent, &p.id)).unwrap_or_default();
         return Err(Conflict(format!(
-            "本机这份有存储里这个版本没有的内容，没有恢复，什么也没改：\n{}{more}\n可以先 nekorisu archive {first} 把本机这份也传上去（两份都会留在存储里）；确定要用存储里的替换本机这份，再加 --replace（MCP 里是 replace=true），本机这份会移到 {}，不会删掉。",
+            "{CONFLICT_LEAD}，没有恢复，什么也没改：\n{}{more}\n可以先 nekorisu archive {first} 把本机这份也传上去（两份都会留在存储里）；确定要用存储里的替换本机这份，再加 --replace（MCP 里是 replace=true），本机这份会移到 {}，不会删掉。",
             shown.join("\n"),
             env.paths.replaced_dir().display()
         ))

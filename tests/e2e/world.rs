@@ -39,7 +39,36 @@ pub struct Device {
     pub name: String,
     pub root: PathBuf,
     pub id: String,
-    core: Option<tokio::process::Child>,
+    /// Running core: a task waits on it (reaping it when it exits, as launchd or systemd
+    /// would); sending on the channel stops it.
+    core: Option<(tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
+    /// Installed with the install script (`system.rs`): the test name its login start and
+    /// keychain items go by.
+    pub system: Option<String>,
+    /// Folders put in front of PATH (the developer's `claude`, `codex`).
+    pub extra_path: Vec<PathBuf>,
+    pub extra_env: Vec<(&'static str, OsString)>,
+    /// Programs of the installed copy the scenario started (core, an agent's MCP server).
+    pub spawned: Vec<Spawned>,
+    /// Set when the scenario signed Claude Code in somewhere (cleanup deletes its keychain item).
+    pub claude_signed_in: bool,
+    /// Core started by the system (launchd) rather than by the scenario.
+    pub system_core_pid: Option<u32>,
+}
+
+/// A program the scenario started; a task waits on it (so it is reaped when it exits).
+#[derive(Debug)]
+pub struct Spawned {
+    pub pid: u32,
+    pub what: String,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    waiter: tokio::task::JoinHandle<()>,
+}
+
+impl Spawned {
+    pub fn exited(&self) -> bool {
+        self.waiter.is_finished()
+    }
 }
 
 impl Device {
@@ -54,6 +83,12 @@ impl Device {
             root,
             id: String::new(),
             core: None,
+            system: None,
+            extra_path: Vec::new(),
+            extra_env: Vec::new(),
+            spawned: Vec::new(),
+            claude_signed_in: false,
+            system_core_pid: None,
         })
     }
 
@@ -74,25 +109,55 @@ impl Device {
         self.nekorisu_home().join("config.toml")
     }
 
-    fn envs(&self) -> Vec<(&'static str, OsString)> {
-        vec![
+    pub fn env(&self) -> Vec<(&'static str, OsString)> {
+        let mut env = self.base_env();
+        if let Some(name) = &self.system {
+            env.push(("NEKORISU_E2E_NAME", name.into()));
+            if cfg!(target_os = "macos") {
+                // The real keychain, under this device's own service names.
+                env.retain(|(key, _)| *key != "NEKORISU_SECRETS");
+            }
+        }
+        if !self.extra_path.is_empty() {
+            let mut dirs = self.extra_path.clone();
+            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            env.push(("PATH", std::env::join_paths(dirs).unwrap_or_default()));
+        }
+        env.extend(self.extra_env.iter().cloned());
+        env
+    }
+
+    fn base_env(&self) -> Vec<(&'static str, OsString)> {
+        let mut env: Vec<(&'static str, OsString)> = vec![
             ("NEKORISU_HOME", self.nekorisu_home().into()),
             ("CLAUDE_CONFIG_DIR", self.claude_home().into()),
             ("CODEX_HOME", self.root.join("x").into()),
-            ("HOME", self.home().into()),
+            // nekorisu's idea of the home folder (debug builds only).
+            ("NEKORISU_E2E_HOME", self.home().into()),
             ("USERPROFILE", self.home().into()),
+            // Where login start and Claude Code's caches are looked for (`uninstall` removes
+            // them): never the developer's own.
+            ("LOCALAPPDATA", self.home().join("AppData").join("Local").into()),
+            ("XDG_CONFIG_HOME", self.home().join(".config").into()),
+            ("XDG_CACHE_HOME", self.home().join(".cache").into()),
             // Secrets in files under NEKORISU_HOME, never the developer's keychain (debug builds only).
             ("NEKORISU_SECRETS", "file".into()),
             // No self-update during a scenario.
             ("NEKORISU_UPDATE_FIRST_CHECK_SECS", "86400".into()),
             ("NO_COLOR", "1".into()),
-        ]
+        ];
+        // macOS keeps the real HOME: the keychain is found through it, and with another one
+        // `security` asks the person, in a dialog, which keychain to use.
+        if !cfg!(target_os = "macos") {
+            env.push(("HOME", self.home().into()));
+        }
+        env
     }
 
     fn command(&self, args: &[String]) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(bin());
         cmd.args(args)
-            .envs(self.envs())
+            .envs(self.env())
             .current_dir(&self.root)
             .kill_on_drop(true);
         cmd
@@ -101,14 +166,30 @@ impl Device {
     /// Starts this device's core and waits until it answers.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         let log = std::fs::File::create(self.root.join("core.out"))?;
-        let child = self
+        let mut child = self
             .command(&["daemon".to_string()])
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()
             .context("core did not start")?;
-        self.core = Some(child);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let waiter = tokio::spawn(async move {
+            let exited = tokio::select! {
+                _ = child.wait() => true,
+                _ = stopped => false,
+            };
+            if !exited {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        });
+        self.core = Some((stop, waiter));
+        self.wait_for_core().await
+    }
+
+    /// Waits until this device's core answers, and notes the device ID it made.
+    pub async fn wait_for_core(&mut self) -> anyhow::Result<()> {
         let started = Instant::now();
         loop {
             let ran = self.run(&["core".into(), "status".into()], None).await?;
@@ -116,7 +197,9 @@ impl Device {
                 break;
             }
             if started.elapsed() > Duration::from_secs(30) {
-                bail!("core of {} did not answer: {}", self.name, self.core_log());
+                let log =
+                    std::fs::read_to_string(self.nekorisu_home().join("run").join("core.log")).unwrap_or_default();
+                bail!("core of {} did not answer: {}{log}", self.name, self.core_log());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -124,6 +207,65 @@ impl Device {
             serde_json::from_slice(&std::fs::read(self.nekorisu_home().join("device.json"))?)?;
         self.id = device["id"].as_str().unwrap_or_default().to_string();
         Ok(())
+    }
+
+    /// Starts the installed command (`~/.local/bin/nekorisu`) with `args` and leaves it running
+    /// with its input open, as an agent keeps its MCP server; `log` sends its output to core.out.
+    pub fn spawn_installed(&mut self, args: &[&str], log: bool) -> anyhow::Result<u32> {
+        let mut command = tokio::process::Command::new(crate::system::link(self));
+        command
+            .args(args)
+            .envs(self.env())
+            .current_dir(&self.root)
+            .stdin(Stdio::piped())
+            .kill_on_drop(true);
+        if log {
+            let file = std::fs::File::create(self.root.join("core.out"))?;
+            command.stdout(file.try_clone()?).stderr(file);
+        } else {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let mut child = command.spawn().context("the installed nekorisu did not start")?;
+        let pid = child.id().context("no pid")?;
+        let input = child.stdin.take();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let waiter = tokio::spawn(async move {
+            let _input = input;
+            let exited = tokio::select! {
+                _ = child.wait() => true,
+                _ = stopped => false,
+            };
+            if !exited {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        });
+        self.spawned.push(Spawned {
+            pid,
+            what: args.join(" "),
+            stop: Some(stop),
+            waiter,
+        });
+        Ok(pid)
+    }
+
+    /// Runs the installed command, as a person or an agent would after installing.
+    pub async fn run_installed(&self, args: &[String]) -> anyhow::Result<Ran> {
+        let out = tokio::process::Command::new(crate::system::link(self))
+            .args(args)
+            .envs(self.env())
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(COMMAND_TIMEOUT, out)
+            .await
+            .map_err(|_| anyhow!("nekorisu {} took over {COMMAND_TIMEOUT:?}", args.join(" ")))??;
+        Ok(Ran {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 
     pub fn core_log(&self) -> String {
@@ -160,7 +302,7 @@ impl Device {
         let mut cmd = CommandBuilder::new(bin());
         cmd.args(args);
         cmd.cwd(&self.root);
-        for (key, value) in self.envs() {
+        for (key, value) in self.env() {
             cmd.env(key, value);
         }
         let input = format!("{input}\r\n");
@@ -238,10 +380,19 @@ impl Device {
     }
 
     pub async fn stop(&mut self) {
-        if let Some(mut child) = self.core.take() {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+        if let Some((stop, waiter)) = self.core.take() {
+            let _ = stop.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(10), waiter).await;
         }
+        for spawned in &mut self.spawned {
+            if let Some(stop) = spawned.stop.take() {
+                let _ = stop.send(());
+            }
+        }
+        for spawned in self.spawned.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(10), spawned.waiter).await;
+        }
+        crate::system::clean_up(self);
     }
 }
 

@@ -61,8 +61,20 @@ NEKORISU_E2E_SERVER_IMAGE=<服务端镜像> tests/e2e/server.sh
 
 还没实现的功能，场景先写上，标 `@wip`，就不会执行；实现以后去掉标签。只在一种系统上成立的场景标 `@unix` 或 `@windows`。没有对应句子的步骤会让测试失败，所以写错了会看得到。
 
+## 真的系统
+
+`uninstall_system.feature` 用真的安装脚本装上再卸载（`system.rs`）：测试把要测的 `nekorisu` 打成和发布版一样的压缩包，放在本地文件夹里交给 `install.sh` / `install.ps1`，装到设备目录下。
+
+- 开机自启：macOS 用真的 launchd（launchd 起不来 core 的机器，比如没有登录界面的 CI，就从装好的命令启动）；Windows 的安装脚本跳过计划任务（计划任务带不过去设备目录），另建一个测试名字的计划任务代替；Linux 这里没有 `systemd --user`，写下 `core enable` 在那种情况下会留下的单元文件。
+- macOS 的密码存进真的钥匙串，Windows 的安装脚本改真的用户 PATH。
+- 名字都是测试专用的：调试版认 `NEKORISU_E2E_NAME`，launchd 的标签、计划任务名、钥匙串的服务名都带上它，碰不到开发机自己装的那份。场景结束时（不管过没过）把剩下的都清掉。发布版不认这个变量。
+- macOS 上不改 `HOME`：钥匙串和 Claude Code 的登录都按真的 `HOME` 找，改了会弹出“找不到钥匙圈”的对话框。nekorisu 自己的主目录用调试版认的 `NEKORISU_E2E_HOME` 换成设备目录。
+- 标 `@claude`、`@codex` 的场景用开发机上装的 `claude`、`codex`（配置目录换成设备目录），没装就跳过；也可以用 `NEKORISU_E2E_CLAUDE`、`CODEX_CLI_PATH` 指定。
+- 标 `@server @claude` 的场景让真的 Claude Code 在测试服务端上走一遍 OAuth 登录：`BROWSER` 换成一个记下网址的脚本，场景用测试管理员密码在授权页上同意，再看卸载时 `claude mcp logout` 有没有把服务端那条授权撤掉。`server.sh` 为此给服务端设了 `NEKORISU_PUBLIC_URL`。
+- 在别的机器上跑时，`NEKORISU_E2E_SCRIPTS` 指向 `scripts` 文件夹。
+
 ## 碰不到的
 
-- 真的 Claude Code、Codex 程序：用合成的会话文件；Codex 的恢复要调 `codex` 程序，这里没有。
-- 系统钥匙串：测试用调试版的 `NEKORISU_SECRETS=file`，密码和令牌存在设备目录下的文件里，不碰开发机的钥匙串。发布版不认这个变量。
-- 开机自启、自动更新：不在这里测。
+- 真的 Claude Code、Codex 的会话：用合成的会话文件；Codex 的恢复要调 `codex` 程序，这里没有。
+- 其他场景的钥匙串：用调试版的 `NEKORISU_SECRETS=file`，密码和令牌存在设备目录下的文件里。
+- 自动更新：不在这里测。

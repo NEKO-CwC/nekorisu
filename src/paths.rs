@@ -119,7 +119,26 @@ pub fn default_link() -> PathBuf {
 
 /// The user's home: `HOME` on Unix; on Windows the profile folder (`USERPROFILE`), where
 /// Claude Code and Codex keep their files, then `HOME` (Git Bash sets it too).
+/// Debug builds only: `NEKORISU_E2E_NAME` (letters, digits, `-`) gives login start and the
+/// keychain items names of their own, so end-to-end tests use the real launchd, Task Scheduler
+/// and keychain without touching the developer's own. Release builds never read it.
+pub fn test_name() -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let name = std::env::var("NEKORISU_E2E_NAME").ok()?;
+    let ok = !name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    ok.then_some(name)
+}
+
 pub fn home_dir() -> PathBuf {
+    // Debug builds only: end-to-end tests on macOS keep the real HOME, which the keychain and
+    // Claude Code's sign-ins go by, and give nekorisu a home of its own with this.
+    if cfg!(debug_assertions)
+        && let Some(home) = std::env::var_os("NEKORISU_E2E_HOME").filter(|h| !h.is_empty())
+    {
+        return PathBuf::from(home);
+    }
     pick_home(cfg!(windows), std::env::var_os("USERPROFILE"), std::env::var_os("HOME"))
 }
 

@@ -3,12 +3,13 @@
 //! in-process WebDAV storage and, when it asks for one, a trusted source. See README.md here.
 //!
 //! `cargo test --test e2e` runs them all. Scenarios tagged `@wip` are skipped; `@unix` and
-//! `@windows` run only there. `E2E_NAME=<part of a scenario name>` runs only matching ones.
+//! `@windows` run only there; `@claude` and `@codex` only where that program is installed. `E2E_NAME=<part of a scenario name>` runs only matching ones.
 //! To run a copy of the test program elsewhere, point `NEKORISU_E2E_BIN` at a `nekorisu` binary
 //! and `NEKORISU_E2E_FEATURES` at the features folder.
 
 mod standins;
 mod steps;
+mod system;
 mod world;
 
 use cucumber::World as _;
@@ -26,6 +27,13 @@ fn runnable_here(tags: &[String]) -> bool {
         return false;
     }
     if has("windows") && !cfg!(windows) {
+        return false;
+    }
+    // Need the developer's own Claude Code or Codex (run with this device's settings folders).
+    if has("claude") && system::claude().is_none() {
+        return false;
+    }
+    if has("codex") && system::codex().is_none() {
         return false;
     }
     true

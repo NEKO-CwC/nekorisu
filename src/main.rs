@@ -34,6 +34,7 @@ mod testdav;
 #[cfg(test)]
 mod testsource;
 mod timefmt;
+mod uninstall;
 mod update;
 
 use clap::{Parser, Subcommand};
@@ -106,6 +107,8 @@ enum Command {
     Mcp,
     /// 运行常驻的 core（平时由系统在登录时启动：nekorisu core enable）
     Daemon,
+    /// 卸载：先列出要删的，问清楚再删，删完再查一遍。Agent 里的会话和存储里的备份不动
+    Uninstall(uninstall::UninstallArgs),
     /// 检查并更新到新版本（core 平时每天自己检查一次）
     Update {
         /// 只检查，不下载
@@ -149,5 +152,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Mcp => mcp::run().await,
         Command::Daemon => daemon::run().await,
         Command::Update { check } => cli::update(check).await,
+        Command::Uninstall(args) => uninstall::run(args).await,
     }
 }

@@ -260,4 +260,27 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 - 东西放在哪：`~/.nekorisu/`、`~/.local/bin/nekorisu`（Windows 上还有 `nekorisu-start.exe`）、Agent 的 MCP 配置、skill 文件夹；
 - 本机有多少聊天记录，存了多少；
 - 以后怎么用：跟 Agent 说一句"帮我把最近的会话存起来"或者"找一下上周那段聊天"就行；
-- 怎么撤销：`nekorisu core disable` 取消开机自启，`claude mcp remove nekorisu`（还有 `nekorisu-server`），删掉 skill 文件夹。客户端本身还没有卸载命令。Windows 上安装脚本加进 PATH 的 `~\.local\bin`，可以在"编辑账户的环境变量"里删掉。
+- 怎么撤销：说要卸载时，按下一节运行 `nekorisu uninstall`。它会先列出要删的东西，问清楚再删，删完再查一遍；Agent 里的会话和存储里的备份不动。
+
+### 卸载（他说要卸载时）
+
+- **先看清单。** 不带选项运行一次 `nekorisu uninstall`（Windows 上 `nekorisu.exe uninstall`）。不在终端里运行时，它只列出会删什么、不动什么，再列出还要回答的问题，然后停下，什么都不删。
+- **把问题转给他，替他答不了。** 最多三个：
+  - 这台电脑往存储传过会话的，要不要先把它们放回 Agent 的目录（`--restore` / `--no-restore`）。放回只补缺的和不完整的，本机已有、更完整的不动。
+  - `~/.nekorisu/replaced/` 里有 restore 替换下来的本机旧副本的，留着还是删掉（`--replaced keep` 会把它们移到主目录下的 `nekorisu-replaced`，`--replaced delete` 一起删掉）。
+  - 确认卸载（`--yes`）。
+- **再带上他的回答运行一次**，比如 `nekorisu uninstall --restore --replaced keep --yes`。它按顺序做这些事：
+  1. 需要的话先放回会话。有会话没放回去，就停在这里，什么都不删。
+  2. 在 Claude Code、Codex 里先退出服务端的登录，再删掉 MCP；Claude Code 退出登录时，服务端那条授权会一起撤销。
+  3. 删掉 skill 和 Claude Code 给这些 MCP 记的日志。
+  4. 取消开机自启，让 core 退出，结束别的 nekorisu 进程。别的会话里的 nekorisu 工具会断开，你这个会话的也会。
+  5. 删掉钥匙串里的存储密码和来源令牌、命令链接、`~/.nekorisu/`。Windows 上还删 `nekorisu-start.exe`，`~\.local\bin` 删空了就从 PATH 里去掉。
+- **转告结果。** 最后一段"还要你看一下的"照实告诉他，常见的有两条：Codex 退出登录不通知服务端，要在服务端 panel 的"应用"页撤销 Codex 那条授权；接过服务端来源的，panel 的设备页还会留着这台电脑上报过的状态。安装时你自己下载到临时目录的东西（比如先存下来看过的安装脚本），也一起删掉。
+- **旧版本没有这个命令**（提示没有 `uninstall`）：先运行 `nekorisu update` 升级，再按上面做。升级不了，就照下面手动删，删之前先看 `~/.nekorisu/replaced/` 里有没有东西，有就问他留不留：
+  - `nekorisu core disable`；
+  - `claude mcp logout nekorisu-server`，再 `claude mcp remove -s user nekorisu` 和 `claude mcp remove -s user nekorisu-server`。Codex 用 `codex mcp logout nekorisu-server`、`codex mcp remove nekorisu`、`codex mcp remove nekorisu-server`；
+  - 删掉 `~/.claude/skills/nekorisu`、`~/.claude/skills/nekorisu-server`，Codex 是 `~/.codex/skills/` 下的这两个；
+  - macOS 上，钥匙串里服务名是 `nekorisu-storage` 和 `nekorisu-source` 的条目：分别反复运行 `security delete-generic-password -s nekorisu-storage`（和 `-s nekorisu-source`），直到提示找不到；
+  - 删掉 `~/.local/bin/nekorisu` 和 `~/.nekorisu/`；Windows 上还有 `~\.local\bin\nekorisu-start.exe`，`~\.local\bin` 空了，就在"编辑账户的环境变量"里把它从 PATH 删掉；
+  - Claude Code 的 MCP 日志：macOS 在 `~/Library/Caches/claude-cli-nodejs/` 下，Linux 在 `~/.cache/claude-cli-nodejs/` 下，Windows 在 `%LOCALAPPDATA%\claude-cli-nodejs\Cache\` 下，删掉各项目文件夹里的 `mcp-logs-nekorisu` 和 `mcp-logs-nekorisu-server`；
+  - 还在运行的 `nekorisu mcp` 进程，在那些会话关掉时退出，也可以直接结束它们。
