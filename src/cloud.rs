@@ -89,6 +89,23 @@ impl Source {
         Ok(changed)
     }
 
+    /// Forgets the source: source.json, what it sent (`remote/`), and the switch for running
+    /// its scripts. Its token is for `secrets` to delete; config.toml is not touched. Nothing
+    /// to remove is fine.
+    pub fn remove(paths: &Paths) -> anyhow::Result<()> {
+        Exec::off(paths, "撤掉了来源")?;
+        match fs::remove_file(source_file(paths)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        match fs::remove_dir_all(remote_dir(paths)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn check(&self) -> anyhow::Result<()> {
         crate::config::check_storage_name(&self.name).map_err(|_| {
             anyhow!(
@@ -980,6 +997,31 @@ mod tests {
         };
         assert!(other.save(&paths).unwrap());
         assert!(!remote_dir(&paths).exists());
+    }
+
+    #[test]
+    fn removing_the_source_forgets_what_it_sent() {
+        let (_dir, paths) = home();
+        let source = Source {
+            name: "home".into(),
+            url: "https://nekorisu.example:8443".into(),
+            keys: vec![SecretKey::generate().public().to_base64()],
+        };
+        source.save(&paths).unwrap();
+        fs::create_dir_all(remote_dir(&paths).join("3")).unwrap();
+        fs::write(remote_dir(&paths).join("current"), "3").unwrap();
+        Exec::on(&paths, "synthetic").unwrap();
+        fs::write(paths.home.join("config.toml"), "# synthetic\n").unwrap();
+
+        Source::remove(&paths).unwrap();
+        assert_eq!(Source::load(&paths).unwrap(), None);
+        assert!(!remote_dir(&paths).exists());
+        assert!(!Exec::load(&paths).allowed);
+        assert!(
+            paths.home.join("config.toml").exists(),
+            "the device's own settings stay"
+        );
+        Source::remove(&paths).unwrap();
     }
 
     use nekorisu::sign::SecretKey;

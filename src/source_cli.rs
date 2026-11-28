@@ -1,4 +1,4 @@
-//! `nekorisu source add | login | sync | status | accept | reject | allow-exec | deny-exec`: the
+//! `nekorisu source add | login | remove | sync | status | accept | reject | allow-exec | deny-exec`: the
 //! trusted source is set only here, on the device, and its token goes into the keychain.
 //! Pulling from it is core's job; these commands write the local files and ask core to pull.
 //! Saying yes to the source (`accept`, `allow-exec`) needs the person at a terminal typing the
@@ -34,6 +34,8 @@ pub enum SourceAction {
     },
     /// 设置来源的令牌：终端里输入，不回显；不在终端里就从标准输入读一行。存进系统钥匙串，没有钥匙串的系统存进只有本人能读的文件
     Login,
+    /// 撤掉来源：删掉它的地址、公钥、令牌和它发来的配置，关掉“接受所有内容”。config.toml 里本机写的设置不动
+    Remove,
     /// 现在就问来源有没有新配置（core 平时按配置的间隔自己问）
     Sync,
     /// 来源、在用的配置、上次检查的结果、待确认的请求，以及各项设置和路径映射最后用的是哪边的
@@ -57,6 +59,7 @@ pub async fn run(action: SourceAction) -> anyhow::Result<()> {
     match action {
         SourceAction::Add { name, url, keys } => add(&paths, name, url, keys).await,
         SourceAction::Login => login(&paths).await,
+        SourceAction::Remove => remove(&paths).await,
         SourceAction::Sync => sync().await,
         SourceAction::Status { json } => status(json).await,
         SourceAction::Accept { id } => answer(id, true).await,
@@ -246,6 +249,38 @@ async fn login(paths: &Paths) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || secrets::store_kind(Kind::Source, &store_paths, &name, &token)).await??;
     println!("已把来源 {} 的令牌存进{}", source.name, secrets::place());
     sync_if_running().await;
+    Ok(())
+}
+
+async fn remove(paths: &Paths) -> anyhow::Result<()> {
+    let source = Source::load(paths)?;
+    let (blocking_paths, name) = (paths.clone(), source.as_ref().map(|s| s.name.clone()));
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // The token first: when that fails the source is still set, and running this again finishes.
+        if let Some(name) = name {
+            secrets::delete_kind(Kind::Source, &blocking_paths, &name)?;
+        }
+        // Without a source this only clears what an earlier one may have left.
+        Source::remove(&blocking_paths)
+    })
+    .await??;
+    let Some(source) = source else {
+        println!("没有设置来源，不用撤掉");
+        return Ok(());
+    };
+    println!(
+        "已撤掉来源 {}（{}）：它的令牌和发来的配置都删了，config.toml 里本机写的设置没动",
+        source.name, source.url
+    );
+    // A running core goes back to config.toml alone now, not at its next look.
+    if let Some(mut core) = client::connect_existing().await
+        && let Err(err) = core.sync_source(SyncSourceRequest {}).await
+    {
+        eprintln!(
+            "没能通知 core（{}）；运行 nekorisu core stop，再运行 nekorisu core start，来源下发的设置就不再生效",
+            err.message()
+        );
+    }
     Ok(())
 }
 

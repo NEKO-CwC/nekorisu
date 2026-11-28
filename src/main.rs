@@ -87,7 +87,7 @@ enum Command {
         #[command(subcommand)]
         action: storage_cli::StorageAction,
     },
-    /// 可信来源（服务端）：add 设置地址和公钥、login 存令牌、sync 现在就取配置、status 看状态
+    /// 可信来源（服务端）：add 设置地址和公钥、login 存令牌、remove 撤掉、sync 现在就取配置、status 看状态
     Source {
         #[command(subcommand)]
         action: source_cli::SourceAction,

@@ -81,6 +81,16 @@ pub fn load_kind(kind: Kind, paths: &Paths, name: &str) -> anyhow::Result<Option
     }
 }
 
+/// Forgets what was stored for `name`; nothing stored is fine.
+pub fn delete_kind(kind: Kind, paths: &Paths, name: &str) -> anyhow::Result<()> {
+    check_storage_name(name)?;
+    if keychain() {
+        keychain_delete(kind.service(), name)
+    } else {
+        file_delete(&kind.dir(paths), name)
+    }
+}
+
 /// Where `store` puts the password, for the message after `storage login`.
 pub fn place() -> &'static str {
     if keychain() {
@@ -180,6 +190,22 @@ fn keychain_load(service: &str, name: &str) -> anyhow::Result<Option<String>> {
     bail!("读不了钥匙串（security 退出码 {}）", output.status.code().unwrap_or(-1))
 }
 
+fn keychain_delete(service: &str, name: &str) -> anyhow::Result<()> {
+    // On success `security` prints the item's attributes; they stay in `output`.
+    let output = Command::new("security")
+        .args(["delete-generic-password", "-s", service, "-a", name])
+        .stdin(Stdio::null())
+        .output()
+        .context("找不到 security 命令，没法用钥匙串")?;
+    if output.status.success() || output.status.code() == Some(KEYCHAIN_NOT_FOUND) {
+        return Ok(());
+    }
+    bail!(
+        "没能从钥匙串删掉（security 退出码 {}）",
+        output.status.code().unwrap_or(-1)
+    )
+}
+
 fn suffix(line: &str) -> String {
     if line.is_empty() {
         String::new()
@@ -218,6 +244,14 @@ fn file_load(dir: &std::path::Path, name: &str) -> anyhow::Result<Option<String>
             Ok(Some(text.strip_suffix('\r').unwrap_or(text).to_string()))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn file_delete(dir: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    match fs::remove_file(dir.join(name)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
 }
@@ -297,5 +331,24 @@ mod tests {
             fs::read_dir(paths.secrets_dir()).unwrap().count() == 2,
             "the password, the source folder, no temp file left"
         );
+    }
+
+    #[test]
+    fn file_backend_forgets_one_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: dir.path().to_path_buf(),
+        };
+        let (storage, source) = (Kind::Storage.dir(&paths), Kind::Source.dir(&paths));
+        file_store(&paths, &storage, "home", "synthetic pass").unwrap();
+        file_store(&paths, &source, "home", "synthetic token").unwrap();
+        file_delete(&source, "home").unwrap();
+        assert_eq!(file_load(&source, "home").unwrap(), None);
+        assert_eq!(
+            file_load(&storage, "home").unwrap().as_deref(),
+            Some("synthetic pass"),
+            "a storage of the same name keeps its password"
+        );
+        file_delete(&source, "home").unwrap();
     }
 }

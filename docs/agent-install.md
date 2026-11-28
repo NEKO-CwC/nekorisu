@@ -168,7 +168,7 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
     ```bash
     powershell -NoProfile -Command 'Start-Process -FilePath "$env:USERPROFILE\.local\bin\nekorisu.exe" -ArgumentList "storage","login","<名字>" -Wait'
     ```
-- **在后台等他输完。** 告诉他"输完回来就行"，然后用你的后台任务或监控能力等密码存好；没有这种能力，就每隔几秒查一次。最多等 5 分钟：
+- **在后台等他输完。** 告诉他输完就行，不用回来说，你会自己看到；然后用你的后台任务或监控能力等密码存好；没有这种能力，就每隔几秒查一次。存好了就直接往下做。他在这期间回来说"输好了"，说的就是这个密码，不是你接下来要问的事。最多等 5 分钟，还没存好就问他是窗口没出现，还是不想现在弄。怎么查存好没有：
   - macOS：`security find-generic-password -s nekorisu-storage -a <名字> >/dev/null 2>&1` 成功，就说明存好了；
   - Linux：`test -f ~/.nekorisu/secrets/<名字>` 成功，就说明存好了。
   - Windows：`~\.nekorisu\secrets\<名字>` 这个文件在了（PowerShell 里 `Test-Path "$env:USERPROFILE\.nekorisu\secrets\<名字>"`），就说明存好了。它放在用户文件夹里，只有他本人、系统和管理员能读。
@@ -211,15 +211,22 @@ printenv CODEX_THREAD_ID | xargs -r printf 'nekorisu-hello:%s' | shasum -a 256 |
 
 **让这台电脑从服务端取设置（可选）。** 服务端可以统一下发设置，比如恢复别的电脑上的会话时，工作目录换到这台电脑的哪里（路径映射）；这台电脑自己写的设置也会报给服务端，在 panel 里能看、能改。用一句话讲清楚，问他要不要。
 
+- **他要接，先问他拿不拿得到设备令牌；拿得到，再运行下面的命令。** 接上要输入一个设备令牌，就是部署服务端时设的 `NEKORISU_DEVICE_TOKEN`，不是 panel 的管理员密码。panel 上看不到它的值，只能到部署服务端的地方去取。下面的命令请他自己在服务器上运行，令牌不要发给你：
+  - 用 docker compose 部署的：`docker-compose.yml` 旁边的 `secrets/device_token` 文件；
+  - 照服务端仓库的 k8s 说明部署的：`kubectl -n nekorisu get secret nekorisu-secrets -o jsonpath='{.data.device-token}' | base64 -d`；
+  - 别的部署方式：看部署时 `NEKORISU_DEVICE_TOKEN` 是怎么设的，或者 `NEKORISU_DEVICE_TOKEN_FILE` 指向哪个文件。
+
+  拿不到（比如服务端不是他部署的，又找不到部署的人），就跳过这一步，什么都不运行。跳过不影响回读验收，以后随时能接。
 - 要客户端 0.2.0 或更新的版本（`nekorisu --version`）。旧的先 `nekorisu update`。
 - 连接说明（`/connect`）和 `setup_info` 里都有现成的 `nekorisu source add …` 命令（里面有服务端的地址和公钥），原样运行。旧版服务端没有连接说明，就请他打开 panel 的"配置"页，把那条命令复制给你。公钥只能这样在本机设置，服务端改不了它；公钥本来就是公开的，从连接说明里取和从 panel 复制一样可信。
-- **令牌在终端里输入，不经过你。** 令牌是服务端给设备用的那个（部署时设的 `NEKORISU_DEVICE_TOKEN`），不是 panel 的管理员密码。和存储密码一样，替他打开一个终端窗口，里面运行着 `~/.local/bin/nekorisu source login`（Windows 上 `-ArgumentList "source","login"`），他输完回来告诉你。
-- 在后台等他输完，最多 5 分钟：
+- **令牌在终端里输入，不经过你。** 和存储密码一样，替他打开一个终端窗口，里面运行着 `~/.local/bin/nekorisu source login`（Windows 上 `-ArgumentList "source","login"`），告诉他输完就行，不用回来说。
+- 在后台等他输完，最多 5 分钟。他中途说找不到令牌、不弄了，就停掉等待，按本节最后一条撤掉。怎么查存好没有：
   - macOS：`security find-generic-password -s nekorisu-source -a <名字> >/dev/null 2>&1` 成功；`<名字>` 是 `source add` 后面那个，通常是 `home`；
   - Linux：`test -f ~/.nekorisu/secrets/source/<名字>` 成功；
   - Windows：`Test-Path "$env:USERPROFILE\.nekorisu\secrets\source\<名字>"` 为真。
 - 检查：`nekorisu source status`。看到"在用的配置：第 N 版"就是接上了；有"上次检查出错"就把原因告诉他。
 - 服务端发来的请求（强制改掉这台电脑锁定的设置、请这台电脑允许运行服务端的脚本）要**他本人在终端里**确认：`nekorisu source accept <请求ID>`、`nekorisu source allow-exec`，命令会让他再输入一次请求 ID。你没有终端，替不了他，也不要试。工具返回里提到有待确认的请求时，转告他运行 `nekorisu source status` 看看。
+- **撤掉。** 已经运行了 `source add`，最后又不接了，就运行 `nekorisu source remove`：删掉来源、它的令牌和它发来的配置；`config.toml` 里这台电脑自己写的设置不动。提示没有这个命令（旧版本），就删掉 `~/.nekorisu/source.json` 和 `~/.nekorisu/remote/` 文件夹（Windows 在 `%USERPROFILE%\.nekorisu\` 下），再运行 `nekorisu core stop`、`nekorisu core start`。
 
 ### 6. 回读验收（可选）
 
